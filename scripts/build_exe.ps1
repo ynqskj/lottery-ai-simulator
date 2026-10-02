@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipInstall
+    [switch]$SkipInstall,
+    [string]$PythonPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,7 +14,7 @@ $AppName = "lottery-ai-simulator"
 $DistDir = Join-Path $RepoRoot "dist\$AppName"
 $BuildDir = Join-Path $RepoRoot "build\$AppName"
 $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-$PythonExe = if (Test-Path -LiteralPath $VenvPython) { $VenvPython } else { "python" }
+$PythonExe = if ($PythonPath) { $PythonPath } elseif (Test-Path -LiteralPath $VenvPython) { $VenvPython } else { "python" }
 
 function Test-PyInstaller {
     & $PythonExe -m PyInstaller --version *> $null
@@ -40,6 +41,10 @@ if (-not (Test-PyInstaller)) {
 }
 
 foreach ($path in @($DistDir, $BuildDir)) {
+    $resolvedTarget = [System.IO.Path]::GetFullPath($path)
+    if (-not $resolvedTarget.StartsWith(([string]$RepoRoot + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Build target is outside the repository: $resolvedTarget"
+    }
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Recurse -Force
     }
@@ -72,6 +77,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -Path "scripts" -Destination (Join-Path $DistDir "scripts") -Recurse -Force
+# Windows PowerShell 5.1 needs a BOM to recognize UTF-8 script source.
+Get-ChildItem -LiteralPath (Join-Path $DistDir "scripts") -Filter "*.ps1" | ForEach-Object {
+    $scriptText = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($_.FullName, $scriptText, [System.Text.UTF8Encoding]::new($true))
+}
+Copy-Item -LiteralPath "README.md", "LICENSE" -Destination $DistDir -Force
+Copy-Item -LiteralPath "assets" -Destination $DistDir -Recurse -Force
 New-Item -ItemType Directory -Force -Path (Join-Path $DistDir "data\normalized") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DistDir "data\users") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DistDir "reports\latest") | Out-Null

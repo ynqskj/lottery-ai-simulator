@@ -104,6 +104,10 @@ def run_dashboard(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Frozen Python does not apply PYTHONIOENCODING during interpreter startup.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--cli":
         return run_cli(args[1:])

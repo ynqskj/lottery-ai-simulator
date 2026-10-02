@@ -2,6 +2,7 @@ from contextlib import closing
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+from lottery_sim.file_io import atomic_path, file_lock
 
 
 SCHEMA = (
@@ -59,7 +60,13 @@ SCHEMA = (
 def init_history_db(db_path: Path) -> None:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(db_path)) as conn, conn:
+    with file_lock(db_path), closing(sqlite3.connect(db_path)) as conn, conn:
+        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(recommendation_records)")}
+        if old_columns and "payout_basis" not in old_columns:
+            backup_path = db_path.with_name(db_path.name + ".pre-1.2.bak")
+            if not backup_path.exists():
+                with atomic_path(backup_path) as temporary, closing(sqlite3.connect(temporary)) as backup:
+                    conn.backup(backup)
         for statement in SCHEMA:
             conn.execute(statement)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(recommendation_records)")}

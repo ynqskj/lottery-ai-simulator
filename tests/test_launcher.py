@@ -10,6 +10,18 @@ import launcher
 
 
 class LauncherTests(unittest.TestCase):
+    def test_frozen_cli_output_is_utf8_even_when_default_is_cp936(self):
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding='cp936')
+        def cli_output(argv):
+            print('中文推荐报告完成')
+            return 0
+        with patch.object(sys, 'stdout', stream), patch('lottery_sim.cli.main', side_effect=cli_output):
+            self.assertEqual(launcher.main(['--cli']), 0)
+            stream.flush()
+        self.assertIn('中文推荐报告完成', buffer.getvalue().decode('utf-8'))
+        stream.detach()
+
     def test_application_root_uses_executable_parent_when_frozen(self):
         with (
             patch.object(sys, "frozen", True, create=True),
