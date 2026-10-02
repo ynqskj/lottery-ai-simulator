@@ -15,19 +15,95 @@ def _flat(markup):
     return markup.replace("点开批次可查看", "每个批次直接展示")
 
 
+def _generation_actions(games):
+    from lottery_sim import dashboard as d
+    actions = _flat(d._render_actions(games))
+    actions = re.sub(r'<nav class="game-action-tabs".*?</nav>', '', actions, flags=re.S)
+    actions = actions.replace('<h2>本地操作</h2>', '<h2>生成推荐</h2>')
+    # Move the same action buttons ahead of each game's existing parameter controls.
+    def move_buttons(match):
+        opening, body = match.group(1), match.group(2)
+        found = re.search(r'<div class="action-buttons">.*?</div>', body, re.S)
+        return opening + found.group(0) + body.replace(found.group(0), '', 1) + '</div>'
+    actions = re.sub(r'(<div class="game-action-pane[^>]*>)(.*?<div class="action-buttons">.*?</div>\s*)</div>', move_buttons, actions, flags=re.S)
+    def parameter_tabs(match):
+        markup = match.group(0)
+        keys = [('basic', '基础设置')]
+        markup = re.sub(r'<div class="basic-param-grid">(.*?)</div>', r'<div class="parameter-page active" data-param-panel="basic"><div class="basic-param-grid">\1</div></div>', markup, flags=re.S)
+        def advanced(section):
+            key = 'positions' if 'data-position-enable' in section.group(0) else 'training'
+            keys.append((key, '位组合' if key == 'positions' else '训练参数'))
+            return '<div class="parameter-page" data-param-panel="'+key+'">'+section.group(0)+'</div>'
+        markup = re.sub(r'<section class="advanced-params">.*?</section>', advanced, markup, flags=re.S)
+        tabs = '<nav class="parameter-tabs" aria-label="参数分组">' + ''.join(f'<button type="button" class="action-button{ " active" if key == "basic" else ""}" data-param-tab="{key}" aria-pressed="{ "true" if key == "basic" else "false"}">{label}</button>' for key,label in keys) + '</nav>'
+        return markup.replace('<div class="parameter-page active"', tabs+'<div class="parameter-page active"', 1)
+    actions = re.sub(r'<section class="param-panel">.*?\n</section>', parameter_tabs, actions, flags=re.S)
+    return actions
+
+
+def _summary_markup(game, summary_text):
+    from lottery_sim import dashboard as d
+    scoped = d._filter_summary_for_game(summary_text, game)
+    headers, rows, notes = [], [], []
+    for line in scoped.splitlines():
+        if '|' in line:
+            cells = [cell.strip() for cell in line.split('|')]
+            if all(re.fullmatch(r'[-: ]+', cell or '-') for cell in cells):
+                continue
+            if not headers:
+                headers = cells
+            else:
+                rows.append(cells)
+        elif line.startswith(('统计口径', '奖金口径')):
+            notes.append(line)
+    table = ''
+    if rows:
+        headings = ''.join('<th>'+html.escape(cell)+'</th>' for cell in headers)
+        body = ''.join('<tr>'+''.join('<td>'+html.escape(cell)+'</td>' for cell in row)+'</tr>' for row in rows)
+        table = '<table><thead><tr>'+headings+'</tr></thead><tbody>'+body+'</tbody></table>'
+    elif scoped.strip() and not headers:
+        table = '<div class="summary-text">'+''.join('<p>'+html.escape(line)+'</p>' for line in scoped.splitlines() if line.strip())+'</div>'
+        notes = []
+    else:
+        table = '<p class="empty">暂无该彩种长期统计。</p>'
+    notes_html = ''.join('<p class="panel-note">'+html.escape(note)+'</p>' for note in notes)
+    return '<section class="panel"><h2>'+html.escape(game.name)+' 长期汇总</h2>'+table+notes_html+'</section>'
+
+
+def _batch_reader(games):
+    from lottery_sim import dashboard as d
+    choices = []
+    batches = []
+    for index, batch in enumerate(d._recommendation_batches(games)):
+        label = f'{batch.game_name} · {batch.target_issue} · {batch.generated_at} · {batch.count}注'
+        choices.append(f'<option value="{index}" data-batch-game="{html.escape(batch.game_code)}">{html.escape(label)}</option>')
+        markup = _flat(d._render_recommendation_batch(batch))
+        batches.append('<div data-batch-panel="'+str(index)+'">'+markup+'</div>')
+    return '<section class="panel"><label class="batch-picker-label">选择生成批次<select data-batch-picker>'+''.join(choices)+'</select></label><p data-batch-empty class="empty" hidden>当前彩种暂无生成批次。</p>'+''.join(batches)+'</section>'
+
+
+def _report_reader(game):
+    tabs, panels = [], []
+    for index, (title, text) in enumerate(game.reports.items()):
+        if not text:
+            continue
+        key = str(index)
+        tabs.append(f'<button type="button" class="action-button" data-report-tab="{key}">{html.escape(title)}</button>')
+        panels.append(f'<section data-report-panel="{key}"><h2>{html.escape(game.name)} {html.escape(title)}</h2><pre>{html.escape(text)}</pre></section>')
+    return '<section class="panel report-reader"><nav class="report-reader-tabs" aria-label="报告类型">'+''.join(tabs)+'</nav>'+''.join(panels)+'</section>' if tabs else '<section class="panel"><p class="empty">暂无该彩种报告。</p></section>'
+
+
 def render_workspace(model):
     from lottery_sim import dashboard as d
     nav = ''.join(f'<button type="button" class="workspace-nav-button{ " active" if index == 0 else ""}" data-workspace-nav="{key}" aria-current="{ "page" if index == 0 else "false"}">{label}</button>' for index, (key, label) in enumerate(PAGES))
     options = ''.join(f'<option value="{html.escape(game.code)}"{ " selected" if index == d._default_game_index(model.games) else ""}>{html.escape(game.name)}</option>' for index, game in enumerate(model.games))
-    actions = _flat(d._render_actions(model.games))
-    actions = re.sub(r'<nav class="game-action-tabs".*?</nav>', '', actions, flags=re.S)
-    actions = actions.replace('<h2>本地操作</h2>', '<h2>生成推荐</h2>')
+    actions = _generation_actions(model.games)
     content = {
         'overview': ''.join(_game_section(game, d._render_game_overview(game)) for game in model.games),
-        'generate': actions + ''.join(_game_section(game, d._render_game_candidates(game)) for game in model.games),
+        'generate': '<div class="generation-layout"><div>'+actions+'</div><div>'+''.join(_game_section(game, d._render_game_candidates(game)) for game in model.games)+'</div></div>',
         'analysis': ''.join(_game_section(game, d._render_game_analysis(game)) for game in model.games),
-        'history': '<nav class="history-layout-tabs" aria-label="历史展示"><button type="button" class="action-button active" data-history-view="summary" aria-pressed="true">长期汇总与全部记录</button><button type="button" class="action-button" data-history-view="batches" aria-pressed="false">按生成批次查看</button></nav><section class="history-layout-panel active" data-history-panel="summary">' + ''.join(_game_section(game, d._render_game_summary(game, model.recommendation_summary)) for game in model.games) + '</section><section class="history-layout-panel" data-history-panel="batches">' + _flat(d._render_global_recommendation_history(model.games)) + '</section>',
-        'reports': ''.join(_game_section(game, d._render_game_reports(game)) for game in model.games),
+        'history': '<nav class="history-layout-tabs" aria-label="历史展示"><button type="button" class="action-button active" data-history-view="records" aria-pressed="true">全部记录</button><button type="button" class="action-button" data-history-view="summary" aria-pressed="false">长期汇总</button><button type="button" class="action-button" data-history-view="batches" aria-pressed="false">生成批次</button></nav><section class="history-layout-panel active" data-history-panel="records">' + ''.join(_game_section(game, '<section class="panel">'+d._render_recommendation_history_table(game)+'</section>') for game in model.games) + '</section><section class="history-layout-panel" data-history-panel="summary">' + ''.join(_game_section(game, _summary_markup(game, model.recommendation_summary)) for game in model.games) + '</section><section class="history-layout-panel" data-history-panel="batches">' + _batch_reader(model.games) + '</section>',
+        'reports': ''.join(_game_section(game, _report_reader(game)) for game in model.games),
         'settings': _flat(d._render_backend_panel(model)),
     }
     pages = ''.join(f'<section class="workspace-page{ " active" if index == 0 else ""}" data-workspace-page="{key}" aria-label="{label}">{content[key]}</section>' for index, (key, label) in enumerate(PAGES))
@@ -49,6 +125,21 @@ def layout_css():
 .workspace-nav-button:hover { background: var(--surface-2); }
 .workspace-nav-button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .workspace-main { min-width: 0; }
+.workspace-toolbar { position: sticky; top: 0; z-index: 5; }
+.generation-layout { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(300px, 1fr); gap: 16px; align-items: start; }
+.generation-layout > div { min-width: 0; }
+.workspace-page .actions .action-buttons { margin: 10px 0 12px; position: sticky; top: 70px; z-index: 4; background: var(--surface); padding: 8px 0; }
+.parameter-tabs, .report-reader-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.parameter-tabs .active, .report-reader-tabs .active { color: var(--blue); border-color: var(--blue); }
+.parameter-page { display: none; }
+.parameter-page.active { display: block; }
+.report-reader pre { max-height: 60vh; overflow: auto; }
+.report-reader [data-report-panel] { display: none; }
+.report-reader [data-report-panel].active { display: block; }
+.batch-picker-label { display: grid; gap: 8px; font-weight: 700; margin-bottom: 16px; }
+[data-batch-panel][hidden] { display: none; }
+@media (max-width: 1000px) { .generation-layout { grid-template-columns: 1fr; } }
+
 .app-header p { overflow-wrap: anywhere; }
 .history-layout-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
 .history-layout-tabs .active { color: var(--blue); border-color: var(--blue); }
@@ -84,11 +175,36 @@ def layout_js():
     return """
 const workspaceGame = document.getElementById('workspace-game');
 const workspaceNavigation = document.querySelectorAll('[data-workspace-nav]');
+function updateBatchReader(game) {
+  const picker = document.querySelector('[data-batch-picker]');
+  const choices = Array.from(picker.options).filter(option => option.dataset.batchGame === game);
+  Array.from(picker.options).forEach(option => { option.hidden = option.dataset.batchGame !== game; option.disabled = option.hidden; });
+  if (!choices.some(option => option.value === picker.value)) picker.value = choices.length ? choices[0].value : '';
+  picker.disabled = choices.length === 0;
+  document.querySelector('[data-batch-empty]').hidden = choices.length !== 0;
+  document.querySelectorAll('[data-batch-panel]').forEach(panel => { panel.hidden = !choices.length || panel.dataset.batchPanel !== picker.value; });
+}
+document.querySelector('[data-batch-picker]').addEventListener('change', () => updateBatchReader(workspaceGame.value));
+document.querySelectorAll('[data-game-pane]').forEach(pane => {
+  pane.querySelectorAll('[data-param-tab]').forEach(button => button.addEventListener('click', () => {
+    pane.querySelectorAll('[data-param-tab]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', item === button ? 'true' : 'false'); });
+    pane.querySelectorAll('[data-param-panel]').forEach(panel => panel.classList.toggle('active', panel.dataset.paramPanel === button.dataset.paramTab));
+  }));
+});
+document.querySelectorAll('.report-reader').forEach(reader => {
+  const tabs = Array.from(reader.querySelectorAll('[data-report-tab]'));
+  const select = button => {
+    tabs.forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', item === button ? 'true' : 'false'); });
+    reader.querySelectorAll('[data-report-panel]').forEach(panel => panel.classList.toggle('active', panel.dataset.reportPanel === button.dataset.reportTab));
+  };
+  tabs.forEach(button => button.addEventListener('click', () => select(button)));
+  if (tabs.length) select(tabs[0]);
+});
 function selectWorkspaceGame() {
   const game = workspaceGame.value;
   document.querySelectorAll('[data-workspace-game]').forEach(section => { section.hidden = section.dataset.workspaceGame !== game; });
   document.querySelectorAll('[data-game-pane]').forEach(pane => pane.classList.toggle('active', pane.dataset.gamePane === game));
-  document.querySelectorAll('[data-history-game]').forEach(batch => { batch.hidden = batch.dataset.historyGame !== game; });
+  updateBatchReader(game);
 }
 document.querySelectorAll('[data-history-view]').forEach(button => button.addEventListener('click', () => {
   document.querySelectorAll('[data-history-view]').forEach(item => { item.classList.toggle('active', item === button); item.setAttribute('aria-pressed', item === button ? 'true' : 'false'); });
@@ -106,7 +222,7 @@ document.querySelectorAll('.workspace-page table').forEach(table => {
   const wrapper = document.createElement('div'); wrapper.className = 'table-scroll';
   table.parentNode.insertBefore(wrapper, table); wrapper.appendChild(table);
   const rows = Array.from(table.querySelectorAll('tbody > tr'));
-  const size = 20;
+  const size = 5;
   if (rows.length <= size) return;
   const controls = document.createElement('div'); controls.className = 'table-pagination';
   const previous = document.createElement('button'); previous.type = 'button'; previous.textContent = '上一页';
