@@ -1002,6 +1002,7 @@ def _command_env() -> Dict[str, str]:
 
 
 def render_dashboard_html(model: DashboardModel) -> str:
+    from lottery_sim.dashboard_layout import render_workspace, layout_css, layout_js
     return "\n".join([
         "<!doctype html>",
         "<html lang=\"zh-CN\">",
@@ -1011,19 +1012,17 @@ def render_dashboard_html(model: DashboardModel) -> str:
         "<title>彩票模拟分析仪表盘</title>",
         "<style>",
         _dashboard_css(),
+        layout_css(),
         "</style>",
         "</head>",
         "<body>",
         "<main class=\"shell\">",
         _render_header(model),
-        _render_actions(model.games),
-        _render_global_recommendation_history(model.games),
-        _render_backend_panel(model),
-        _render_lottery_tabs(model.games),
-        _render_lottery_panes(model),
+        render_workspace(model),
         "</main>",
         "<script>",
         _dashboard_js(),
+        layout_js(),
         "</script>",
         "</body>",
         "</html>",
@@ -1725,7 +1724,7 @@ def _render_recommendation_batch(batch: RecommendationBatchHistory) -> str:
     status = "已开奖" if batch.pending_count == 0 and batch.checked_count else "待开奖"
     detail_rows = "\n".join(_render_recommendation_batch_detail_row(record) for record in batch.records)
     return f"""
-<details class="recommendation-batch">
+<details class="recommendation-batch" data-history-game="{html.escape(batch.game_code)}">
   <summary>
     <span>{html.escape(batch.game_name)}</span>
     <span>目标期 {html.escape(batch.target_issue or '-')}</span>
