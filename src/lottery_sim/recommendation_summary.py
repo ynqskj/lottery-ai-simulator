@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from lottery_sim.draw_metadata import payout_basis_summary
 from lottery_sim.recommendation_tracking import RecommendationRecord, load_recommendation_records
 
 
@@ -16,6 +17,7 @@ class StrategyRecommendationSummary:
     winning_count: int
     total_cost: float
     total_payout: float
+    payout_note: str = "奖金口径：含历史估算，非实际领取收益。"
 
     @property
     def hit_rate(self) -> float:
@@ -39,6 +41,7 @@ class RecommendationSummaryResult:
     winning_count: int
     total_cost: float
     total_payout: float
+    payout_note: str = "奖金口径：含历史估算，非实际领取收益。"
 
     @property
     def hit_rate(self) -> float:
@@ -61,7 +64,8 @@ def load_records_from_paths(paths: Sequence[Path]) -> List[RecommendationRecord]
 
 
 def summarize_recommendation_records(records: Iterable[RecommendationRecord]) -> RecommendationSummaryResult:
-    record_list = list(records)
+    from lottery_sim.recommendation_store import unique_recommendation_records
+    record_list = unique_recommendation_records(records)
     buckets: Dict[Tuple[str, str, str], List[RecommendationRecord]] = {}
     for record in record_list:
         key = (record.game_code, record.game_name, record.strategy_name)
@@ -81,12 +85,15 @@ def summarize_recommendation_records(records: Iterable[RecommendationRecord]) ->
         winning_count=sum(1 for record in checked if record.payout > 0),
         total_cost=sum(record.cost for record in checked),
         total_payout=sum(record.payout for record in checked),
+        payout_note=payout_basis_summary(checked),
     )
 
 
 def render_recommendation_summary_report(result: RecommendationSummaryResult) -> str:
     lines = [
         "推荐长期表现汇总",
+        "统计口径：同一期、同策略、同号码只统计一次；所有生成批次保留。",
+        result.payout_note,
         "",
         f"记录总数：{result.total_records}",
         f"已校验：{result.checked_count}",

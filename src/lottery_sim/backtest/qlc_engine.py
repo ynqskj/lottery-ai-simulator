@@ -1,3 +1,5 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.prize_rules import evaluate_draw_prize, game_for_draw
 from typing import List, Protocol, Sequence
 
 from lottery_sim.games.qlc import QlcGame
@@ -20,17 +22,16 @@ def run_qlc_backtest(
     if min_history < 0:
         raise ValueError("min_history 不能小于0")
 
-    ordered_draws = sorted(draws, key=lambda draw: int(draw.issue))
+    ordered_draws = sorted(draws, key=lambda draw: normalize_issue(draw.issue))
     bet_results: List[BetResult] = []
     hit_distribution = {level: 0 for level in game.prize_amounts}
 
     for index in range(min_history, len(ordered_draws)):
         target = ordered_draws[index]
         history = tuple(ordered_draws[:index])
-        pick = game.validate_pick(strategy.generate(history))
-        level = game.prize_level(target.numbers, pick)
-        payout = game.prize_amounts[level]
-        hit_distribution[level] += 1
+        pick = game_for_draw(game, target).validate_pick(strategy.generate(history))
+        level, payout, payout_basis = evaluate_draw_prize(game, target, pick)
+        hit_distribution[level] = hit_distribution.get(level, 0) + 1
 
         bet_results.append(
             BetResult(
@@ -40,6 +41,7 @@ def run_qlc_backtest(
                 hit=payout > 0,
                 cost=game.ticket_cost,
                 payout=payout,
+                payout_basis=payout_basis,
             )
         )
 

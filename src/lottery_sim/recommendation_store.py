@@ -1,3 +1,5 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.file_io import file_lock
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -21,10 +23,14 @@ class RecommendationStore:
 
         first = records[0]
         path = self.record_path(first.game_code, first.target_issue)
-        existing = load_recommendation_records(path) if path.exists() else []
-        merged, added = merge_unique_recommendation_records(existing, records)
-        save_recommendation_records(merged, path)
+        if any(r.game_code != first.game_code or r.target_issue != first.target_issue for r in records):
+            raise ValueError("一个保存批次只能包含同彩种同目标期")
+        with file_lock(path):
+            existing = load_recommendation_records(path) if path.exists() else []
+            merged, added = merge_unique_recommendation_records(existing, records)
+            save_recommendation_records(merged, path)
         return path, added, len(merged)
+
 
     def all_record_paths(self) -> Tuple[Path, ...]:
         if not self.root.exists():
@@ -77,10 +83,20 @@ def _record_completeness(record: RecommendationRecord) -> Tuple[int, int, int, f
     )
 
 
-def _record_key(record: RecommendationRecord) -> Tuple[str, str, str, str]:
+def _record_key(record: RecommendationRecord) -> tuple:
     return (
         record.game_code,
-        record.target_issue,
+        normalize_issue(record.target_issue),
         record.strategy_name,
         record.numbers,
+        record.run_id or record.generated_at,
     )
+
+
+def unique_recommendation_records(records):
+    """Keep batches on disk, count each strategy/issue/pick once in aggregate."""
+    unique = {}
+    for record in records:
+        key = (record.game_code, normalize_issue(record.target_issue), record.strategy_name, record.numbers)
+        unique[key] = _prefer_record(unique[key], record) if key in unique else record
+    return list(unique.values())

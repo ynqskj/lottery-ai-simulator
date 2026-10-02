@@ -1,3 +1,5 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.prize_rules import evaluate_draw_prize, game_for_draw
 from typing import List, Protocol, Sequence
 
 from lottery_sim.games.fucai3d import Fucai3DGame
@@ -20,15 +22,15 @@ def run_backtest(
     if min_history < 0:
         raise ValueError("min_history 不能小于0")
 
-    ordered_draws = sorted(draws, key=lambda draw: int(draw.issue))
+    ordered_draws = sorted(draws, key=lambda draw: normalize_issue(draw.issue))
     bet_results: List[BetResult] = []
     hit_distribution = {"direct_hit": 0, "miss": 0}
 
     for index in range(min_history, len(ordered_draws)):
         target = ordered_draws[index]
         history = tuple(ordered_draws[:index])
-        pick = game.validate_pick(strategy.generate(history))
-        payout = game.payout(target.numbers, pick)
+        pick = game_for_draw(game, target).validate_pick(strategy.generate(history))
+        level, payout, payout_basis = evaluate_draw_prize(game, target, pick)
         hit = payout > 0
 
         if hit:
@@ -44,6 +46,7 @@ def run_backtest(
                 hit=hit,
                 cost=game.ticket_cost,
                 payout=payout,
+                payout_basis=payout_basis,
             )
         )
 

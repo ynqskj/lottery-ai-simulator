@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Tuple, Optional
 
 
 Pick3D = Tuple[int, int, int]
@@ -90,6 +90,9 @@ class Draw3D:
     draw_date: str
     numbers: Pick3D
     source: str = "17500"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
     @property
     def number_text(self) -> str:
@@ -102,6 +105,9 @@ class Draw5D:
     draw_date: str
     numbers: Pick5D
     source: str = "17500-pl5"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
     @property
     def number_text(self) -> str:
@@ -114,6 +120,9 @@ class DrawSSQ:
     draw_date: str
     numbers: SsqPick
     source: str = "17500-ssq"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +131,9 @@ class DrawDLT:
     draw_date: str
     numbers: DltPick
     source: str = "17500-dlt"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +142,9 @@ class DrawQXC:
     draw_date: str
     numbers: QxcPick
     source: str = "17500-qxc"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +153,9 @@ class DrawQLC:
     draw_date: str
     numbers: QlcDrawNumbers
     source: str = "17500-qlc"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +164,9 @@ class DrawKL8:
     draw_date: str
     numbers: Tuple[int, ...]
     source: str = "17500-kl8"
+    prize_amounts: Dict[str, float] = field(default_factory=dict)
+    special_prize_active: Optional[bool] = None
+    prize_pool: Optional[float] = None
 
     @property
     def number_text(self) -> str:
@@ -159,7 +180,8 @@ class BetResult:
     pick_numbers: Any
     hit: bool
     cost: int
-    payout: int
+    payout: float
+    payout_basis: str = "estimated"
 
 
 @dataclass(frozen=True)

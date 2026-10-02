@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$DataDir = "data/normalized",
     [string]$ReportDir = "reports/latest",
@@ -10,6 +10,9 @@ param(
     [string]$Seeds = "1,2,3,4,5",
     [int]$Window = 30,
     [int]$Count = 10,
+    [string]$PositionCounts = "",
+    [ValidateSet("top", "full")]
+    [string]$CombinationMode = "top",
     [int]$MlMinHistory = 30,
     [int]$MlMinTrain = 200,
     [int]$MlTrainEpochs = 8,
@@ -23,13 +26,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Utf8 = [System.Text.UTF8Encoding]::new()
+[Console]::InputEncoding = $Utf8
 [Console]::OutputEncoding = $Utf8
 $OutputEncoding = $Utf8
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 $env:PYTHONPATH = "src"
+$PythonExecutable = $env:LOTTERY_PYTHON
+if (-not $PythonExecutable -and -not $env:LOTTERY_CLI_EXE) {
+    $LocalPython = Join-Path $RepoRoot ".venv/Scripts/python.exe"
+    if (Test-Path -LiteralPath $LocalPython) { $PythonExecutable = $LocalPython }
+    else { $PythonExecutable = (Get-Command python -ErrorAction Stop).Source }
+}
 
 $Games = @(
     [pscustomobject]@{ Code = "3d"; Csv = "$DataDir/fucai3d.csv"; Update = "update-3d"; Backtest = "backtest-3d"; Compare = "compare-3d"; Stability = "stability-3d"; Recommend = "recommend-3d"; Record = "record-recommend-3d"; Verify = "verify-recommend-3d"; Extra = @() },
@@ -62,6 +73,30 @@ else {
     $SelectedGames = @($Games | Where-Object { $_.Code -eq $Game })
 }
 
+$PositionArguments = @()
+if ($PositionCounts) {
+    if ($All -or $Game -notin @("3d", "pl3", "pl5", "qxc")) {
+        throw "PositionCounts requires one of 3d, pl3, pl5, qxc."
+    }
+    $expected = @{ "3d" = 3; "pl3" = 3; "pl5" = 5; "qxc" = 7 }[$Game]
+    $parts = @($PositionCounts.Split(','))
+    if ($parts.Count -ne $expected) { throw "PositionCounts must contain $expected integers." }
+    $product = 1
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $value = 0
+        $maximum = 10
+        if ($Game -eq "qxc" -and $i -eq 6) { $maximum = 15 }
+        if (-not [int]::TryParse($parts[$i].Trim(), [ref]$value) -or $value -lt 1 -or $value -gt $maximum) {
+            throw "PositionCounts value is outside the allowed range."
+        }
+        $product *= $value
+    }
+    if ($CombinationMode -eq "full" -and $product -gt 1000) { throw "Full combinations cannot exceed 1000." }
+    $PositionArguments = @("--position-counts", $PositionCounts, "--combination-mode", $CombinationMode)
+}
+elseif ($CombinationMode -eq "full") { throw "Full combinations require PositionCounts." }
+if ($Count -lt 1 -or $Count -gt 1000) { throw "Count must be between 1 and 1000." }
+
 function Ensure-Directory {
     param([string]$Path)
 
@@ -84,7 +119,7 @@ function Get-LotteryCommandText {
     if ($env:LOTTERY_CLI_EXE) {
         return "`"$env:LOTTERY_CLI_EXE`" --cli " + ($Arguments -join " ")
     }
-    return "python -m lottery_sim.cli " + ($Arguments -join " ")
+    return "`"$PythonExecutable`" -m lottery_sim.cli " + ($Arguments -join " ")
 }
 
 function Invoke-LotteryCli {
@@ -94,7 +129,7 @@ function Invoke-LotteryCli {
         & $env:LOTTERY_CLI_EXE --cli @Arguments
         return
     }
-    & python -m lottery_sim.cli @Arguments
+    & $PythonExecutable -m lottery_sim.cli @Arguments
 }
 
 function Invoke-LotteryCommand {
@@ -149,12 +184,21 @@ foreach ($gameConfig in $SelectedGames) {
     Invoke-LotteryCommand -Name "backtest-$($gameConfig.Code)" -Arguments (@($gameConfig.Backtest, "--csv", $gameConfig.Csv) + $gameConfig.Extra + @("--seed", "$Seed")) -OutputFile "$ReportDir/backtest-$($gameConfig.Code).txt"
     Invoke-LotteryCommand -Name "compare-$($gameConfig.Code)" -Arguments (@($gameConfig.Compare, "--csv", $gameConfig.Csv) + $gameConfig.Extra + @("--seed", "$Seed", "--window", "$Window")) -OutputFile "$ReportDir/compare-$($gameConfig.Code).txt"
     Invoke-LotteryCommand -Name "stability-$($gameConfig.Code)" -Arguments (@($gameConfig.Stability, "--csv", $gameConfig.Csv) + $gameConfig.Extra + @("--seeds", $Seeds, "--window", "$Window")) -OutputFile "$ReportDir/stability-$($gameConfig.Code).txt"
-    Invoke-LotteryCommand -Name "recommend-$($gameConfig.Code)" -Arguments (@($gameConfig.Recommend, "--csv", $gameConfig.Csv) + $gameConfig.Extra + @("--seed", "$Seed", "--window", "$Window", "--count", "$Count")) -OutputFile "$ReportDir/recommend-$($gameConfig.Code).txt"
+    if ($PositionCounts) {
+        if (-not $DryRun) {
+            # Replace only this game's exact report inside the explicit report directory.
+            $statReport = Join-Path ([System.IO.Path]::GetFullPath($ReportDir)) "recommend-$($gameConfig.Code).txt"
+            Set-Content -LiteralPath $statReport -Value "Position mode: recommendations are in the ML report." -Encoding UTF8
+        }
+    }
+    else {
+        Invoke-LotteryCommand -Name "recommend-$($gameConfig.Code)" -Arguments (@($gameConfig.Recommend, "--csv", $gameConfig.Csv) + $gameConfig.Extra + @("--seed", "$Seed", "--window", "$Window", "--count", "$Count")) -OutputFile "$ReportDir/recommend-$($gameConfig.Code).txt"
+    }
 
     $mlModel = Join-Path $ModelDir "$($gameConfig.Code)-ml.json"
     Invoke-LotteryCommand -Name "train-ml-$($gameConfig.Code)" -Arguments (@("train-ml-$($gameConfig.Code)", "--csv", $gameConfig.Csv, "--model", $mlModel, "--min-history", "$MlMinHistory", "--epochs", "$MlTrainEpochs") + $gameConfig.Extra)
     Invoke-LotteryCommand -Name "backtest-ml-$($gameConfig.Code)" -Arguments (@("backtest-ml-$($gameConfig.Code)", "--csv", $gameConfig.Csv, "--min-train", "$MlMinTrain", "--min-history", "$MlMinHistory", "--limit", "$MlBacktestLimit", "--retrain-every", "$MlRetrainEvery", "--epochs", "$MlBacktestEpochs") + $gameConfig.Extra) -OutputFile "$ReportDir/backtest-ml-$($gameConfig.Code).txt"
-    Invoke-LotteryCommand -Name "recommend-ml-$($gameConfig.Code)" -Arguments (@("recommend-ml-$($gameConfig.Code)", "--csv", $gameConfig.Csv, "--model", $mlModel, "--count", "$Count", "--min-history", "$MlMinHistory", "--epochs", "$MlTrainEpochs") + $gameConfig.Extra) -OutputFile "$ReportDir/recommend-ml-$($gameConfig.Code).txt"
+    Invoke-LotteryCommand -Name "recommend-ml-$($gameConfig.Code)" -Arguments (@("recommend-ml-$($gameConfig.Code)", "--csv", $gameConfig.Csv, "--model", $mlModel, "--count", "$Count", "--min-history", "$MlMinHistory", "--epochs", "$MlTrainEpochs") + $gameConfig.Extra + $PositionArguments) -OutputFile "$ReportDir/recommend-ml-$($gameConfig.Code).txt"
     Invoke-LotteryCommand -Name "record-ml-$($gameConfig.Code)" -Arguments (@(
         "record-recommend-ml-$($gameConfig.Code)",
         "--csv",
@@ -169,7 +213,7 @@ foreach ($gameConfig in $SelectedGames) {
         "$MlMinHistory",
         "--epochs",
         "$MlTrainEpochs"
-    ) + $gameConfig.Extra)
+    ) + $gameConfig.Extra + $PositionArguments)
 
     $gameDir = Join-Path $RecommendationDir $gameConfig.Code
     $recordFiles = @()
@@ -203,19 +247,21 @@ foreach ($gameConfig in $SelectedGames) {
         }
     }
 
-    Invoke-LotteryCommand -Name "record-$($gameConfig.Code)" -Arguments (@(
-        $gameConfig.Record,
-        "--csv",
-        $gameConfig.Csv,
-        "--store",
-        $RecommendationDir,
-        "--seed",
-        "$Seed",
-        "--window",
-        "$Window",
-        "--count",
-        "$Count"
-    ) + $gameConfig.Extra)
+    if (-not $PositionCounts) {
+        Invoke-LotteryCommand -Name "record-$($gameConfig.Code)" -Arguments (@(
+            $gameConfig.Record,
+            "--csv",
+            $gameConfig.Csv,
+            "--store",
+            $RecommendationDir,
+            "--seed",
+            "$Seed",
+            "--window",
+            "$Window",
+            "--count",
+            "$Count"
+        ) + $gameConfig.Extra)
+    }
 }
 
 $summaryPath = Join-Path $ReportDir "recommendation-summary.txt"

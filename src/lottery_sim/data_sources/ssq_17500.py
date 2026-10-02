@@ -1,4 +1,6 @@
 import csv
+
+from lottery_sim.draw_metadata import METADATA_FIELDS, metadata_from_row, metadata_to_row
 import re
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +33,7 @@ def save_ssq_draws_csv(draws: Iterable[DrawSSQ], path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "red", "blue", "source"])
+        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "red", "blue", "source"] + METADATA_FIELDS)
         writer.writeheader()
         for draw in draws:
             writer.writerow({
@@ -40,11 +42,12 @@ def save_ssq_draws_csv(draws: Iterable[DrawSSQ], path: Path) -> None:
                 "red": draw.numbers.red_text,
                 "blue": f"{draw.numbers.blue:02d}",
                 "source": draw.source,
+                **metadata_to_row(draw),
             })
 
 
 def load_ssq_draws_csv(path: Path) -> List[DrawSSQ]:
-    with Path(path).open("r", encoding="utf-8", newline="") as f:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
         rows = csv.DictReader(f)
         return [
             DrawSSQ(
@@ -55,6 +58,7 @@ def load_ssq_draws_csv(path: Path) -> List[DrawSSQ]:
                     blue=int(row["blue"]),
                 ),
                 source=row.get("source") or "local",
+                **metadata_from_row(row),
             )
             for row in rows
         ]

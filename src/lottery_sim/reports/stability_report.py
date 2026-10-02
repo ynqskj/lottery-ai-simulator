@@ -14,6 +14,7 @@ def render_stability_report(
 ) -> str:
     lines = [
         f"{game_label}策略稳定性报告",
+        "奖金口径：金额为模拟票面奖金，浮动奖缺失实际单注奖金时采用估算，未扣税，不代表实际领取收益。",
         "",
         "随机种子敏感性：",
         f"随机种子数量：{seed_sensitivity.seed_count}",

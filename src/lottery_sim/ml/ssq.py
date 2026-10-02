@@ -1,11 +1,14 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.prize_rules import evaluate_draw_prize
 import json
+import heapq
 import math
 from dataclasses import dataclass
-from itertools import combinations
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
 from lottery_sim.games.ssq import SsqGame
+from lottery_sim.ml.generic import history_fingerprint, _rank_group_products
 from lottery_sim.models import BacktestResult, BetResult, DrawSSQ, SsqPick
 from lottery_sim.recommendations import Candidate
 
@@ -27,6 +30,9 @@ class SsqMlModel:
     training_target_count: int
     red_model: BinaryLogisticModel
     blue_model: BinaryLogisticModel
+    history_until_issue: str = ""
+    training_epochs: int = 0
+    history_fingerprint: str = ""
 
 
 def train_ssq_ml_model(
@@ -37,7 +43,7 @@ def train_ssq_ml_model(
     learning_rate: float = 0.04,
     l2: float = 0.001,
 ) -> SsqMlModel:
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if len(ordered) <= min_history:
         raise ValueError("not enough draws to train SSQ ML model")
 
@@ -45,6 +51,9 @@ def train_ssq_ml_model(
     red_rows = _build_rows(ordered, min_history, tuple(windows), max_number=33, red=True)
     blue_rows = _build_rows(ordered, min_history, tuple(windows), max_number=16, red=False)
     return SsqMlModel(
+        history_until_issue=ordered[-1].issue,
+        training_epochs=epochs,
+        history_fingerprint=history_fingerprint(ordered),
         feature_names=feature_names,
         windows=tuple(windows),
         min_history=min_history,
@@ -56,41 +65,58 @@ def train_ssq_ml_model(
 
 
 def recommend_ssq_ml(draws: Sequence[DrawSSQ], model: SsqMlModel, count: int = 10) -> List[Candidate]:
-    if count <= 0:
-        raise ValueError("candidate count must be positive")
-
-    history = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    if not 1 <= count <= 1000:
+        raise ValueError("candidate count must be between 1 and 1000")
+    if not draws:
+        raise ValueError("没有历史开奖数据")
+    history = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     red_scores = _score_numbers(history, model, max_number=33, red=True)
     blue_scores = _score_numbers(history, model, max_number=16, red=False)
-    red_pool = red_scores[:14]
-    red_combos = sorted(
-        combinations(red_pool, 6),
-        key=lambda combo: (-sum(score for _, score in combo), tuple(number for number, _ in combo)),
-    )
-    blue_ranked = [number for number, _ in blue_scores]
-
+    red_combos = _rank_red_combinations(red_scores, count)
+    blue_choices = [((number,), score) for number, score in blue_scores]
+    choices = _rank_group_products([red_combos, blue_choices], limit=count)
+    if len(choices) != count:
+        raise ValueError(f"无法满足请求的{count}注")
     candidates: List[Candidate] = []
-    seen = set()
-    for combo in red_combos:
-        blue = blue_ranked[len(candidates) % len(blue_ranked)]
-        red = tuple(sorted(number for number, _ in combo))
-        pick = SsqPick(red=red, blue=blue)  # type: ignore[arg-type]
-        if pick.number_text in seen:
-            continue
-        seen.add(pick.number_text)
-        avg_red_probability = sum(score for _, score in combo) / 6
-        blue_probability = dict(blue_scores)[blue]
+    for (red, red_probability), (blue, blue_probability) in choices:
+        pick = SsqPick(red=red, blue=blue[0])
+        joint_score = (red_probability + blue_probability) / 2
         candidates.append(Candidate(
             rank=len(candidates) + 1,
             strategy_name="双色球机器学习",
             numbers=pick,
             number_text=pick.number_text,
-            reason=f"红球均值概率{avg_red_probability:.3f}，蓝球概率{blue_probability:.3f}",
+            reason=f"模型均值评分{joint_score:.3f}，红球均值评分{red_probability:.3f}，蓝球评分{blue_probability:.3f}",
         ))
-        if len(candidates) >= count:
-            break
-
     return candidates
+
+
+def _rank_red_combinations(scores, limit):
+    ranked = sorted(scores, key=lambda item: (-item[1], item[0]))
+    if len(ranked) < 6:
+        return []
+    def priority(indexes):
+        numbers = tuple(sorted(ranked[index][0] for index in indexes))
+        average = sum(ranked[index][1] for index in indexes) / 6
+        return (-average, numbers, indexes)
+    start = tuple(range(6))
+    heap = [priority(start)]
+    seen = {start}
+    result = []
+    while heap and len(result) < limit:
+        negative_score, numbers, indexes = heapq.heappop(heap)
+        result.append((numbers, -negative_score))
+        for index in range(6):
+            maximum = indexes[index+1] if index < 5 else len(ranked)
+            if indexes[index]+1 >= maximum:
+                continue
+            adjacent = list(indexes)
+            adjacent[index] += 1
+            adjacent = tuple(adjacent)
+            if adjacent not in seen:
+                seen.add(adjacent)
+                heapq.heappush(heap, priority(adjacent))
+    return result
 
 
 def run_ssq_ml_backtest(
@@ -101,7 +127,7 @@ def run_ssq_ml_backtest(
     min_history: int = 30,
     epochs: int = 12,
 ) -> BacktestResult:
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if len(ordered) <= min_train:
         raise ValueError("not enough draws to backtest SSQ ML model")
     start = max(min_train, len(ordered) - limit if limit > 0 else min_train)
@@ -120,9 +146,8 @@ def run_ssq_ml_backtest(
 
         target = ordered[target_index]
         pick = game.validate_pick(recommend_ssq_ml(ordered[:target_index], model, count=1)[0].numbers)
-        level = game.prize_level(target.numbers, pick)
-        payout = game.prize_amounts[level]
-        hit_distribution[level] += 1
+        level, payout, basis = evaluate_draw_prize(game, target, pick)
+        hit_distribution[level] = hit_distribution.get(level, 0) + 1
         bet_results.append(BetResult(
             issue=target.issue,
             draw_numbers=target.numbers,
@@ -130,6 +155,7 @@ def run_ssq_ml_backtest(
             hit=payout > 0,
             cost=game.ticket_cost,
             payout=payout,
+            payout_basis=basis,
         ))
 
     return BacktestResult(
@@ -147,6 +173,9 @@ def save_ssq_ml_model(model: SsqMlModel, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
+        "history_until_issue": model.history_until_issue,
+        "training_epochs": model.training_epochs,
+        "history_fingerprint": model.history_fingerprint,
         "feature_names": list(model.feature_names),
         "windows": list(model.windows),
         "min_history": model.min_history,
@@ -160,6 +189,9 @@ def save_ssq_ml_model(model: SsqMlModel, path: Path) -> None:
 def load_ssq_ml_model(path: Path) -> SsqMlModel:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return SsqMlModel(
+        history_until_issue=str(data.get("history_until_issue", "")),
+        training_epochs=int(data.get("training_epochs", 0)),
+        history_fingerprint=str(data.get("history_fingerprint", "")),
         feature_names=tuple(data["feature_names"]),
         windows=tuple(int(value) for value in data["windows"]),
         min_history=int(data["min_history"]),

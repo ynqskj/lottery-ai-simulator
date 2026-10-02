@@ -1,5 +1,8 @@
 import argparse
+import math
 from pathlib import Path
+
+from lottery_sim.file_io import file_lock
 from typing import Optional, Sequence
 
 from lottery_sim.analysis.stability import (
@@ -71,7 +74,7 @@ from lottery_sim.games.pl5 import PL5Game
 from lottery_sim.games.qlc import QlcGame
 from lottery_sim.games.qxc import QxcGame
 from lottery_sim.games.ssq import SsqGame
-from lottery_sim.issue_calendar import next_issue_from_latest_draw
+from lottery_sim.issue_calendar import next_issue_from_latest_draw, normalize_issue
 from lottery_sim.ml.ssq import (
     load_ssq_ml_model,
     recommend_ssq_ml,
@@ -80,6 +83,7 @@ from lottery_sim.ml.ssq import (
     train_ssq_ml_model,
 )
 from lottery_sim.ml.generic import (
+    history_fingerprint,
     load_generic_ml_model,
     ml_adapter_for_game,
     recommend_generic_ml,
@@ -548,6 +552,9 @@ def _add_generic_ml_parsers(
     recommend.add_argument("--epochs", type=int, default=30, help="自动训练时的训练轮数")
     if pick_size:
         recommend.add_argument("--pick-size", type=int, default=10, help="快乐8任选玩法号码个数，1到10")
+    if code in ("3d", "pl3", "pl5", "qxc"):
+        recommend.add_argument("--position-counts", default="", help="每位候选数，逗号分隔")
+        recommend.add_argument("--combination-mode", choices=("top", "full"), default="top")
     recommend.set_defaults(func=recommend_func)
 
     record = subparsers.add_parser(f"record-recommend-ml-{code}", help=f"保存{label}机器学习推荐记录")
@@ -562,6 +569,9 @@ def _add_generic_ml_parsers(
     record.add_argument("--epochs", type=int, default=30, help="自动训练时的训练轮数")
     if pick_size:
         record.add_argument("--pick-size", type=int, default=10, help="快乐8任选玩法号码个数，1到10")
+    if code in ("3d", "pl3", "pl5", "qxc"):
+        record.add_argument("--position-counts", default="", help="每位候选数，逗号分隔")
+        record.add_argument("--combination-mode", choices=("top", "full"), default="top")
     record.set_defaults(func=record_func)
 
 
@@ -1495,14 +1505,9 @@ def _backtest_ml_ssq(args) -> None:
 
 def _recommend_ml_ssq(args) -> None:
     draws = available_recommendation_draws(load_ssq_draws_csv(Path(args.csv)))
-    model_path = Path(args.model)
-    if model_path.exists():
-        model = load_ssq_ml_model(model_path)
-    else:
-        model = train_ssq_ml_model(draws, min_history=args.min_history, epochs=args.epochs)
-        save_ssq_ml_model(model, model_path)
+    model = _get_ssq_recommendation_model(args, draws)
     candidates = recommend_ssq_ml(draws, model, count=args.count)
-    ordered_draws = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered_draws = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     latest_issue = ordered_draws[-1].issue if ordered_draws else ""
     print(render_recommendation_report(
         game_name="双色球机器学习",
@@ -1657,15 +1662,11 @@ def _backtest_ml_generic(args, game_code: str) -> None:
 
 
 def _recommend_ml_generic(args, game_code: str) -> None:
+    _generic_candidate_options(args, game_code)
     draws, game, adapter = _load_generic_ml_context(args, game_code)
-    model_path = Path(args.model)
-    if model_path.exists():
-        model = load_generic_ml_model(model_path)
-    else:
-        model = train_generic_ml_model(draws, adapter, min_history=args.min_history, epochs=args.epochs)
-        save_generic_ml_model(model, model_path)
-    candidates = recommend_generic_ml(draws, model, adapter, count=args.count)
-    ordered_draws = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    model = _get_generic_recommendation_model(args, draws, adapter)
+    candidates = recommend_generic_ml(draws, model, adapter, **_generic_candidate_options(args, game_code))
+    ordered_draws = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     latest_issue = ordered_draws[-1].issue if ordered_draws else ""
     print(render_recommendation_report(
         game_name=f"{game.name}机器学习",
@@ -1676,6 +1677,7 @@ def _recommend_ml_generic(args, game_code: str) -> None:
 
 
 def _record_recommend_ml_generic(args, game_code: str) -> None:
+    _generic_candidate_options(args, game_code)
     draws, game, adapter = _load_generic_ml_context(args, game_code)
     target_issue = _resolve_recommendation_target_issue(
         game_code=game_code,
@@ -1688,15 +1690,9 @@ def _record_recommend_ml_generic(args, game_code: str) -> None:
         target_issue=target_issue,
         history_until_issue=args.history_until,
     )
-    model_path = Path(args.model)
-    if model_path.exists() and not args.target_issue and not args.history_until:
-        model = load_generic_ml_model(model_path)
-    else:
-        model = train_generic_ml_model(window.history, adapter, min_history=args.min_history, epochs=args.epochs)
-        if not args.target_issue and not args.history_until:
-            save_generic_ml_model(model, model_path)
-
-    candidates = recommend_generic_ml(window.history, model, adapter, count=args.count)
+    model = _get_generic_recommendation_model(args, window.history, adapter,
+        cache=not args.target_issue and not args.history_until)
+    candidates = recommend_generic_ml(window.history, model, adapter, **_generic_candidate_options(args, game_code))
     records = create_recommendation_records(
         game_code=game_code,
         game_name=game.name,
@@ -1722,6 +1718,87 @@ def _record_recommend_ml_generic(args, game_code: str) -> None:
     print(f"total_records: {total}")
 
 
+def _generic_candidate_options(args, game_code):
+    count = args.count
+    if count <= 0 or count > 1000:
+        raise ValueError("candidate count must be between 1 and 1000")
+    raw = getattr(args, "position_counts", "")
+    counts = ()
+    mode = getattr(args, "combination_mode", "top")
+    if raw:
+        if game_code not in ("3d", "pl3", "pl5", "qxc"):
+            raise ValueError("position counts unsupported for this game")
+        try:
+            counts = tuple(int(value.strip()) for value in raw.split(","))
+        except ValueError as exc:
+            raise ValueError("position counts must be comma-separated integers") from exc
+        adapter = ml_adapter_for_game(game_code)
+        if len(counts) != len(adapter.groups) or any(
+            value < 1 or value > spec.max_number-spec.min_number+1
+            for value, spec in zip(counts, adapter.groups)
+        ):
+            raise ValueError("position counts length or range is invalid")
+        if mode == "full":
+            from math import prod
+            if prod(counts) > 1000:
+                raise ValueError("full position combinations cannot exceed 1000")
+    elif mode == "full":
+        raise ValueError("full combination mode requires position counts")
+    return {"count": count, "position_counts": counts, "combination_mode": mode}
+
+
+def _model_history_matches(model, draws, args):
+    from lottery_sim.ml.generic import DEFAULT_WINDOWS, _feature_names
+    try:
+        if tuple(model.windows) != DEFAULT_WINDOWS or tuple(model.feature_names) != _feature_names(DEFAULT_WINDOWS):
+            return False
+        weights = [group.model.weights for group in model.groups] if hasattr(model, "groups") else [model.red_model.weights, model.blue_model.weights]
+        if not weights or any(len(values) != len(model.feature_names) or any(not math.isfinite(value) for value in values) for values in weights):
+            return False
+    except (AttributeError, TypeError, ValueError):
+        return False
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
+    return bool(ordered) and (
+        model.history_until_issue == ordered[-1].issue
+        and model.training_draw_count == len(ordered)
+        and model.min_history == args.min_history
+        and model.training_epochs == args.epochs
+        and model.history_fingerprint == history_fingerprint(ordered)
+    )
+
+
+def _get_generic_recommendation_model(args, draws, adapter, cache=True):
+    model_path = Path(args.model)
+    if cache and model_path.exists():
+        try:
+            model = load_generic_ml_model(model_path)
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            model = None
+        if (model is not None and _model_history_matches(model, draws, args)
+                and model.game_code == adapter.game_code
+                and tuple(group.spec for group in model.groups) == adapter.groups):
+            return model
+    model = train_generic_ml_model(draws, adapter, min_history=args.min_history, epochs=args.epochs)
+    if cache:
+        save_generic_ml_model(model, model_path)
+    return model
+
+
+def _get_ssq_recommendation_model(args, draws, cache=True):
+    model_path = Path(args.model)
+    if cache and model_path.exists():
+        try:
+            model = load_ssq_ml_model(model_path)
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            model = None
+        if model is not None and _model_history_matches(model, draws, args):
+            return model
+    model = train_ssq_ml_model(draws, min_history=args.min_history, epochs=args.epochs)
+    if cache:
+        save_ssq_ml_model(model, model_path)
+    return model
+
+
 def _load_generic_ml_context(args, game_code: str):
     if game_code == "3d":
         return (
@@ -1743,7 +1820,8 @@ def _load_generic_ml_context(args, game_code: str):
         )
     if game_code == "qxc":
         return (
-            available_recommendation_draws(load_qxc_draws_csv(Path(args.csv))),
+            tuple(draw for draw in available_recommendation_draws(load_qxc_draws_csv(Path(args.csv)))
+                  if normalize_issue(draw.issue) >= 2020100),
             QxcGame(),
             ml_adapter_for_game("qxc"),
         )
@@ -1788,7 +1866,7 @@ def _recommend_pick3(args, game) -> None:
 
 
 def _print_recommendation_report(draws, game, strategies, filler_strategy, count: int) -> None:
-    ordered_draws = tuple(sorted(available_recommendation_draws(draws), key=lambda draw: int(draw.issue)))
+    ordered_draws = tuple(sorted(available_recommendation_draws(draws), key=lambda draw: normalize_issue(draw.issue)))
     candidates = generate_candidates(
         history=ordered_draws,
         game=game,
@@ -1917,13 +1995,8 @@ def _record_recommend_ml_ssq(args) -> None:
         target_issue=target_issue,
         history_until_issue=args.history_until,
     )
-    model_path = Path(args.model)
-    if model_path.exists() and not args.target_issue and not args.history_until:
-        model = load_ssq_ml_model(model_path)
-    else:
-        model = train_ssq_ml_model(window.history, min_history=args.min_history, epochs=args.epochs)
-        if not args.target_issue and not args.history_until:
-            save_ssq_ml_model(model, model_path)
+    model = _get_ssq_recommendation_model(args, window.history,
+        cache=not args.target_issue and not args.history_until)
 
     game = SsqGame()
     candidates = recommend_ssq_ml(window.history, model, count=args.count)
@@ -1998,7 +2071,7 @@ def _resolve_recommendation_target_issue(
     if target_issue:
         return target_issue
 
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if not ordered:
         raise ValueError("No draws available")
 
@@ -2096,15 +2169,17 @@ def _verify_recommend_dlt(args) -> None:
 
 
 def _verify_recommend(args, game_code: str, draws, game) -> None:
-    records = load_recommendation_records(Path(args.records))
-    result = evaluate_recommendation_records(
-        records=records,
-        draws=draws,
-        game=game,
-        pick_parser=lambda value: parse_pick_text(game_code, value),
-    )
-    if args.output:
-        save_recommendation_records(result.records, Path(args.output))
+    # The append store uses the same lock: hold it through read/evaluate/replace.
+    with file_lock(Path(args.records)):
+        records = load_recommendation_records(Path(args.records))
+        result = evaluate_recommendation_records(
+            records=records,
+            draws=draws,
+            game=game,
+            pick_parser=lambda value: parse_pick_text(game_code, value),
+        )
+        if args.output:
+            save_recommendation_records(result.records, Path(args.output))
     print(render_recommendation_verification_report(result))
 
 

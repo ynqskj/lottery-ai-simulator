@@ -1,3 +1,4 @@
+from lottery_sim.draw_metadata import payout_basis_summary
 from lottery_sim.analysis.metrics import winning_bet_count
 from lottery_sim.models import BacktestResult
 
@@ -10,6 +11,7 @@ def render_backtest_report(result: BacktestResult, strategy_name: str) -> str:
         f"投注注数：{result.total_bets}",
         f"投入金额：{_format_number(result.total_cost)}",
         f"中奖金额：{_format_number(result.total_payout)}",
+        payout_basis_summary(result.bet_results),
         f"返奖率：{_format_percent(result.roi)}",
         f"中奖注数：{winning_bet_count(result)}",
         "",

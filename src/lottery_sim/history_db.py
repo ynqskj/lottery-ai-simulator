@@ -1,3 +1,4 @@
+from contextlib import closing
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -58,15 +59,18 @@ SCHEMA = (
 def init_history_db(db_path: Path) -> None:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for statement in SCHEMA:
             conn.execute(statement)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(recommendation_records)")}
+        if "payout_basis" not in columns:
+            conn.execute("ALTER TABLE recommendation_records ADD COLUMN payout_basis TEXT NOT NULL DEFAULT 'estimated'")
         conn.commit()
 
 
 def record_dashboard_action(db_path: Path, record: Dict[str, Any]) -> None:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO dashboard_actions (
@@ -92,7 +96,7 @@ def record_dashboard_action(db_path: Path, record: Dict[str, Any]) -> None:
 
 def load_dashboard_actions(db_path: Path, limit: int = 100) -> List[Dict[str, Any]]:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -109,14 +113,14 @@ def load_dashboard_actions(db_path: Path, limit: int = 100) -> List[Dict[str, An
 
 def sync_recommendation_records(db_path: Path, records: Iterable[Any]) -> None:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executemany(
             """
             INSERT OR REPLACE INTO recommendation_records (
                 game_code, target_issue, run_id, rank, generated_at,
                 strategy_name, numbers, status, draw_numbers, prize_level,
-                cost, payout
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cost, payout, payout_basis
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -132,6 +136,7 @@ def sync_recommendation_records(db_path: Path, records: Iterable[Any]) -> None:
                     record.prize_level,
                     float(record.cost or 0),
                     float(record.payout or 0),
+                    getattr(record, "payout_basis", "estimated"),
                 )
                 for record in records
             ],
@@ -147,7 +152,7 @@ def save_dashboard_config(db_path: Path, config: Dict[str, str]) -> None:
         "llm_model",
         "llm_api_key",
     }
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for key, value in config.items():
             if key not in allowed:
                 continue
@@ -160,7 +165,7 @@ def save_dashboard_config(db_path: Path, config: Dict[str, str]) -> None:
 
 def load_dashboard_config(db_path: Path) -> Dict[str, str]:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         rows = conn.execute("SELECT key, value FROM dashboard_config").fetchall()
     config = {str(key): str(value) for key, value in rows}
     api_key = config.get("llm_api_key", "")
@@ -180,7 +185,7 @@ def mask_api_key(value: str) -> str:
 
 def record_training_record(db_path: Path, record: Dict[str, Any]) -> None:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             """
             INSERT INTO training_records (
@@ -201,7 +206,7 @@ def record_training_record(db_path: Path, record: Dict[str, Any]) -> None:
 
 def load_training_records(db_path: Path, limit: int = 50) -> List[Dict[str, Any]]:
     init_history_db(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """

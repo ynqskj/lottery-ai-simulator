@@ -1,6 +1,10 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.prize_rules import evaluate_draw_prize
 import json
+import hashlib
 import math
-from dataclasses import dataclass
+import heapq
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
 
@@ -62,6 +66,9 @@ class GenericMlModel:
     training_draw_count: int
     training_target_count: int
     groups: Tuple[NumberGroupModel, ...]
+    history_until_issue: str = ""
+    training_epochs: int = 0
+    history_fingerprint: str = ""
 
 
 def ml_adapter_for_game(game_code: str, pick_size: int = 10) -> GenericMlAdapter:
@@ -82,6 +89,16 @@ def ml_adapter_for_game(game_code: str, pick_size: int = 10) -> GenericMlAdapter
     raise ValueError(f"unsupported ML game: {game_code}")
 
 
+def history_fingerprint(draws):
+    """Hash the actual training observations, independent of caller order."""
+    observations = [
+        (draw.issue, draw.draw_date, asdict(draw.numbers) if is_dataclass(draw.numbers) else draw.numbers)
+        for draw in sorted(draws, key=lambda draw: normalize_issue(draw.issue))
+    ]
+    payload = json.dumps(observations, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def train_generic_ml_model(
     draws: Sequence[Any],
     adapter: GenericMlAdapter,
@@ -91,7 +108,7 @@ def train_generic_ml_model(
     learning_rate: float = 0.04,
     l2: float = 0.001,
 ) -> GenericMlModel:
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if len(ordered) <= min_history:
         raise ValueError(f"not enough draws to train {adapter.game_code} ML model")
 
@@ -111,6 +128,9 @@ def train_generic_ml_model(
         training_draw_count=len(ordered),
         training_target_count=len(ordered) - min_history,
         groups=tuple(group_models),
+        history_until_issue=ordered[-1].issue,
+        training_epochs=epochs,
+        history_fingerprint=history_fingerprint(ordered),
     )
 
 
@@ -119,13 +139,21 @@ def recommend_generic_ml(
     model: GenericMlModel,
     adapter: GenericMlAdapter,
     count: int = 10,
+    position_counts: Sequence[int] = (),
+    combination_mode: str = "top",
 ) -> List[Candidate]:
-    if count <= 0:
-        raise ValueError("candidate count must be positive")
+    if not 1 <= count <= 1000:
+        raise ValueError("候选数量必须在1到1000之间")
     if model.game_code != adapter.game_code:
         raise ValueError(f"model game {model.game_code} does not match adapter {adapter.game_code}")
 
-    history = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    if tuple(g.spec for g in model.groups) != adapter.groups:
+        raise ValueError("模型玩法与当前玩法不匹配，请重新训练")
+    if not draws:
+        raise ValueError("没有历史开奖数据")
+    if combination_mode not in {"top", "full"}:
+        raise ValueError("组合模式必须是top或full")
+    history = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     ranked_groups = [
         _score_group(history, adapter, group_index, group_model, model.windows)
         for group_index, group_model in enumerate(model.groups)
@@ -135,9 +163,27 @@ def recommend_generic_ml(
         for scores, group_model in zip(ranked_groups, model.groups)
     ]
 
+    pool_description = ""
+    if position_counts:
+        if any(g.pick_count != 1 for g in adapter.groups) or len(position_counts) != len(adapter.groups):
+            raise ValueError("每位数量仅支持直选彩种，且必须与数位数量一致")
+        if any(not isinstance(n, int) or not 1 <= n <= len(scores) for n, scores in zip(position_counts, ranked_groups)):
+            raise ValueError("每位数量超过号码范围")
+        group_variants = [[((number,), score) for number, score in scores[:n]] for n, scores in zip(position_counts, ranked_groups)]
+        pool_description = "；号码池 " + " / ".join(",".join(str(number) for number, _ in scores[:n]) for n, scores in zip(position_counts, ranked_groups))
+        total = math.prod(position_counts)
+        if combination_mode == "full":
+            if total > 1000:
+                raise ValueError("完整组合超过1000注，请减少每位数量或选择前N注")
+            count = total
+        elif count > total:
+            raise ValueError(f"号码池仅有{total}种组合，小于请求的{count}注")
+    elif combination_mode == "full":
+        raise ValueError("完整组合需要设置每位数量")
+
     candidates: List[Candidate] = []
     seen = set()
-    for chosen in _rank_group_products(group_variants):
+    for chosen in _rank_group_products(group_variants, limit=count):
         group_numbers = tuple(numbers for numbers, _ in chosen)
         probability = sum(score for _, score in chosen) / len(chosen)
         pick = adapter.build_pick(group_numbers)
@@ -150,12 +196,12 @@ def recommend_generic_ml(
             strategy_name=f"{adapter.game_name}机器学习",
             numbers=pick,
             number_text=number_text,
-            reason=f"模型均值概率{probability:.3f}，训练历史{model.training_draw_count}期",
+            reason=f"模型均值评分{probability:.3f}，训练历史{model.training_draw_count}期{pool_description}",
         ))
         if len(candidates) >= count:
             return candidates
 
-    return candidates
+    raise ValueError(f"只能生成{len(candidates)}注，无法满足请求的{count}注")
 
 
 def run_generic_ml_backtest(
@@ -168,7 +214,7 @@ def run_generic_ml_backtest(
     min_history: int = 30,
     epochs: int = 12,
 ) -> BacktestResult:
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if len(ordered) <= min_train:
         raise ValueError(f"not enough draws to backtest {adapter.game_code} ML model")
     start = max(min_train, len(ordered) - limit if limit > 0 else min_train)
@@ -186,7 +232,7 @@ def run_generic_ml_backtest(
 
         target = ordered[target_index]
         pick = game.validate_pick(recommend_generic_ml(ordered[:target_index], model, adapter, count=1)[0].numbers)
-        level, payout = _prize_level_and_payout(game, target.numbers, pick)
+        level, payout, basis = evaluate_draw_prize(game, target, pick)
         hit_distribution[level] = hit_distribution.get(level, 0) + 1
         bet_results.append(BetResult(
             issue=target.issue,
@@ -195,6 +241,7 @@ def run_generic_ml_backtest(
             hit=payout > 0,
             cost=game.ticket_cost,
             payout=payout,
+            payout_basis=basis,
         ))
 
     return BacktestResult(
@@ -212,6 +259,9 @@ def save_generic_ml_model(model: GenericMlModel, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
+        "history_until_issue": model.history_until_issue,
+        "training_epochs": model.training_epochs,
+        "history_fingerprint": model.history_fingerprint,
         "game_code": model.game_code,
         "game_name": model.game_name,
         "feature_names": list(model.feature_names),
@@ -237,6 +287,9 @@ def save_generic_ml_model(model: GenericMlModel, path: Path) -> None:
 def load_generic_ml_model(path: Path) -> GenericMlModel:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return GenericMlModel(
+        history_until_issue=str(data.get("history_until_issue", "")),
+        training_epochs=int(data.get("training_epochs", 0)),
+        history_fingerprint=str(data.get("history_fingerprint", "")),
         game_code=str(data["game_code"]),
         game_name=str(data["game_name"]),
         feature_names=tuple(data["feature_names"]),
@@ -434,62 +487,63 @@ def _state_from_flags(flags: Sequence[bool]) -> Dict[str, Any]:
 
 
 def _group_variants(scores: Sequence[Tuple[int, float]], pick_count: int, count: int) -> List[Tuple[Tuple[int, ...], float]]:
+    ranked = sorted(scores, key=lambda item: (-item[1], item[0]))
+    if not 1 <= pick_count <= len(ranked):
+        raise ValueError("选号数量超出号码范围")
     if pick_count == 1:
-        return [((number,), score) for number, score in scores[:max(count * 2, 3)]]
-
-    ranked_numbers = [number for number, _ in scores]
-    score_map = dict(scores)
-    variants: Dict[Tuple[int, ...], float] = {}
-    base = tuple(sorted(ranked_numbers[:pick_count]))
-    variants[base] = _average_score(base, score_map)
-
-    max_extra = min(len(ranked_numbers) - pick_count, max(count * 3, 8))
-    for shift in range(1, max_extra + 1):
-        window = tuple(sorted(ranked_numbers[shift:shift + pick_count]))
-        if len(window) == pick_count:
-            variants[window] = _average_score(window, score_map)
-
-        replacement = ranked_numbers[pick_count + shift - 1]
-        for replace_index in range(pick_count - 1, -1, -1):
-            values = list(ranked_numbers[:pick_count])
-            values[replace_index] = replacement
-            candidate = tuple(sorted(set(values)))
-            if len(candidate) == pick_count:
-                variants[candidate] = _average_score(candidate, score_map)
-            if len(variants) >= count * 4:
-                break
-        if len(variants) >= count * 4:
-            break
-
-    return sorted(variants.items(), key=lambda item: (-item[1], item[0]))[:max(count * 2, count)]
-
-
-def _rank_group_products(
-    group_variants: Sequence[Sequence[Tuple[Tuple[int, ...], float]]]
-) -> List[Tuple[Tuple[Tuple[int, ...], float], ...]]:
-    if not group_variants:
-        return []
-
-    base = tuple(variants[0] for variants in group_variants)
-    choices = {base}
-    max_depth = max(len(variants) for variants in group_variants)
-    for depth in range(1, max_depth):
-        shifted = tuple(variants[min(depth, len(variants) - 1)] for variants in group_variants)
-        choices.add(shifted)
-        for group_index, variants in enumerate(group_variants):
-            if depth >= len(variants):
+        return [((number,), score) for number, score in ranked[:count]]
+    def priority(indexes):
+        numbers = tuple(sorted(ranked[i][0] for i in indexes))
+        score = sum(ranked[i][1] for i in indexes) / pick_count
+        return (-score, numbers, indexes)
+    start = tuple(range(pick_count))
+    heap = [priority(start)]
+    seen = {start}
+    result = []
+    while heap and len(result) < count:
+        negative, numbers, indexes = heapq.heappop(heap)
+        result.append((numbers, -negative))
+        for index in range(pick_count):
+            maximum = indexes[index+1] if index+1 < pick_count else len(ranked)
+            if indexes[index]+1 >= maximum:
                 continue
-            current = list(base)
-            current[group_index] = variants[depth]
-            choices.add(tuple(current))
+            neighbor = list(indexes)
+            neighbor[index] += 1
+            neighbor = tuple(neighbor)
+            if neighbor not in seen:
+                seen.add(neighbor)
+                heapq.heappush(heap, priority(neighbor))
+    return result
 
-    return sorted(
-        choices,
-        key=lambda chosen: (
-            -sum(score for _, score in chosen) / len(chosen),
-            tuple(number for numbers, _ in chosen for number in numbers),
-        ),
-    )
+
+def _rank_group_products(group_variants, limit=None):
+    """Enumerate joint choices in descending score without expanding the full product."""
+    if not group_variants or any(not group for group in group_variants):
+        return []
+    groups = [sorted(group, key=lambda item: (-item[1], item[0])) for group in group_variants]
+    capacity = math.prod(len(group) for group in groups)
+    if limit is None:
+        limit = min(capacity, 10000)
+    def priority(indexes):
+        chosen = tuple(groups[i][j] for i,j in enumerate(indexes))
+        return (-sum(score for _,score in chosen), tuple(n for numbers,_ in chosen for n in numbers), indexes)
+    start = (0,) * len(groups)
+    heap = [priority(start)]
+    seen = {start}
+    result = []
+    while heap and len(result) < limit:
+        _,_,indexes = heapq.heappop(heap)
+        result.append(tuple(groups[i][j] for i,j in enumerate(indexes)))
+        for i in range(len(groups)):
+            if indexes[i] + 1 >= len(groups[i]):
+                continue
+            adjacent = list(indexes)
+            adjacent[i] += 1
+            adjacent = tuple(adjacent)
+            if adjacent not in seen:
+                seen.add(adjacent)
+                heapq.heappush(heap, priority(adjacent))
+    return result
 
 
 def _average_score(numbers: Iterable[int], score_map: Dict[int, float]) -> float:

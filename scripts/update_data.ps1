@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$DataDir = "data/normalized",
     [string]$ReportDir = "reports/latest",
@@ -10,13 +10,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Utf8 = [System.Text.UTF8Encoding]::new()
+[Console]::InputEncoding = $Utf8
 [Console]::OutputEncoding = $Utf8
 $OutputEncoding = $Utf8
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 $env:PYTHONPATH = "src"
+$PythonExecutable = $env:LOTTERY_PYTHON
+if (-not $PythonExecutable -and -not $env:LOTTERY_CLI_EXE) {
+    $LocalPython = Join-Path $RepoRoot ".venv/Scripts/python.exe"
+    if (Test-Path -LiteralPath $LocalPython) { $PythonExecutable = $LocalPython }
+    else { $PythonExecutable = (Get-Command python -ErrorAction Stop).Source }
+}
 
 $Games = @(
     [pscustomobject]@{ Code = "3d"; Csv = "$DataDir/fucai3d.csv"; Update = "update-3d"; Verify = "verify-recommend-3d"; Extra = @() },
@@ -54,7 +62,7 @@ function Get-LotteryCommandText {
     if ($env:LOTTERY_CLI_EXE) {
         return "`"$env:LOTTERY_CLI_EXE`" --cli " + ($Arguments -join " ")
     }
-    return "python -m lottery_sim.cli " + ($Arguments -join " ")
+    return "`"$PythonExecutable`" -m lottery_sim.cli " + ($Arguments -join " ")
 }
 
 function Invoke-LotteryCli {
@@ -64,7 +72,7 @@ function Invoke-LotteryCli {
         & $env:LOTTERY_CLI_EXE --cli @Arguments
         return
     }
-    & python -m lottery_sim.cli @Arguments
+    & $PythonExecutable -m lottery_sim.cli @Arguments
 }
 
 function Invoke-LotteryCommand {

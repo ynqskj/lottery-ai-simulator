@@ -1,3 +1,5 @@
+from lottery_sim.issue_calendar import normalize_issue
+from lottery_sim.prize_rules import evaluate_draw_prize, game_for_draw
 from typing import List, Protocol, Sequence
 
 from lottery_sim.games.kl8 import Kl8Game
@@ -20,7 +22,7 @@ def run_kl8_backtest(
     if min_history < 0:
         raise ValueError("min_history 不能小于0")
 
-    ordered_draws = sorted(draws, key=lambda draw: int(draw.issue))
+    ordered_draws = sorted(draws, key=lambda draw: normalize_issue(draw.issue))
     bet_results: List[BetResult] = []
     hit_distribution = {f"中{hits}": 0 for hits in sorted(game.prize_amounts, reverse=True)}
     hit_distribution["未中奖"] = 0
@@ -28,10 +30,9 @@ def run_kl8_backtest(
     for index in range(min_history, len(ordered_draws)):
         target = ordered_draws[index]
         history = tuple(ordered_draws[:index])
-        pick = game.validate_pick(strategy.generate(history))
-        level = game.prize_level(target.numbers, pick)
-        payout = game.payout(target.numbers, pick)
-        hit_distribution[level] += 1
+        pick = game_for_draw(game, target).validate_pick(strategy.generate(history))
+        level, payout, payout_basis = evaluate_draw_prize(game, target, pick)
+        hit_distribution[level] = hit_distribution.get(level, 0) + 1
 
         bet_results.append(
             BetResult(
@@ -41,6 +42,7 @@ def run_kl8_backtest(
                 hit=payout > 0,
                 cost=game.ticket_cost,
                 payout=payout,
+                payout_basis=payout_basis,
             )
         )
 

@@ -1,4 +1,6 @@
 import csv
+
+from lottery_sim.draw_metadata import METADATA_FIELDS, metadata_from_row, metadata_to_row
 import re
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +33,7 @@ def save_kl8_draws_csv(draws: Iterable[DrawKL8], path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "numbers", "source"])
+        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "numbers", "source"] + METADATA_FIELDS)
         writer.writeheader()
         for draw in draws:
             writer.writerow({
@@ -39,11 +41,12 @@ def save_kl8_draws_csv(draws: Iterable[DrawKL8], path: Path) -> None:
                 "draw_date": draw.draw_date,
                 "numbers": draw.number_text,
                 "source": draw.source,
+                **metadata_to_row(draw),
             })
 
 
 def load_kl8_draws_csv(path: Path) -> List[DrawKL8]:
-    with Path(path).open("r", encoding="utf-8", newline="") as f:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
         rows = csv.DictReader(f)
         return [
             DrawKL8(
@@ -51,6 +54,7 @@ def load_kl8_draws_csv(path: Path) -> List[DrawKL8]:
                 draw_date=row["draw_date"],
                 numbers=_parse_numbers_text(row["numbers"]),
                 source=row.get("source") or "local",
+                **metadata_from_row(row),
             )
             for row in rows
         ]

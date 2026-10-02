@@ -16,6 +16,27 @@ class IssueRule:
 class NextIssue:
     issue: str
     draw_date: date
+    basis: str = "estimated"
+
+
+# Ministry of Finance annual lottery market closure notices:
+# https://zhs.mof.gov.cn/zhengcefabu/202412/t20241206_3949123.htm
+# https://www.mof.gov.cn/gp/xxgkml/zhs/202512/t20251225_3980248.htm
+_CLOSURES = {
+    2025: ((date(2025, 1, 27), date(2025, 2, 5)), (date(2025, 10, 1), date(2025, 10, 4))),
+    2026: ((date(2026, 2, 14), date(2026, 2, 23)), (date(2026, 10, 1), date(2026, 10, 4))),
+}
+
+
+def normalize_issue(issue: str) -> int:
+    """Return YYYYNNN for the supported YYNNN and YYYYNNN formats."""
+    if not isinstance(issue, str) or not issue.isascii() or not issue.isdigit() or len(issue) not in (5, 7):
+        raise ValueError(f"Invalid issue: {issue}")
+    year = int(issue[:-3]) + (2000 if len(issue) == 5 else 0)
+    sequence = int(issue[-3:])
+    if not 1900 <= year <= 2099 or sequence == 0 or sequence > 366:
+        raise ValueError(f"Invalid issue: {issue}")
+    return year * 1000 + sequence
 
 
 _RULES: Dict[str, IssueRule] = {
@@ -38,12 +59,13 @@ def get_issue_rule(game_code: str) -> IssueRule:
 
 
 def is_scheduled_draw_date(game_code: str, value: date) -> bool:
-    return value.weekday() in get_issue_rule(game_code).draw_weekdays
+    return (value.weekday() in get_issue_rule(game_code).draw_weekdays
+            and not any(start <= value <= end for start, end in _CLOSURES.get(value.year, ())))
 
 
 def next_scheduled_draw_date(game_code: str, after_date: date) -> date:
     current = after_date + timedelta(days=1)
-    for _ in range(14):
+    for _ in range(32):
         if is_scheduled_draw_date(game_code, current):
             return current
         current += timedelta(days=1)
@@ -52,24 +74,29 @@ def next_scheduled_draw_date(game_code: str, after_date: date) -> date:
 
 def next_issue_from_latest_draw(game_code: str, latest_issue: str, latest_draw_date: str) -> NextIssue:
     latest_date = _parse_date(latest_draw_date)
+    normalized = normalize_issue(latest_issue)
+    if normalized // 1000 != latest_date.year:
+        raise ValueError("Issue year does not match draw date")
     target_date = next_scheduled_draw_date(game_code, latest_date)
     return NextIssue(
         issue=_next_issue_number(get_issue_rule(game_code), latest_issue, latest_date, target_date),
         draw_date=target_date,
+        basis="scheduled" if latest_date.year in _CLOSURES and target_date.year in _CLOSURES else "estimated",
     )
 
 
 def _next_issue_number(rule: IssueRule, latest_issue: str, latest_date: date, target_date: date) -> str:
-    expected_length = rule.year_digits + rule.sequence_digits
-    if len(latest_issue) != expected_length or not latest_issue.isdigit():
-        return str(int(latest_issue) + 1).zfill(len(latest_issue))
+    normalize_issue(latest_issue)
+    year_digits = len(latest_issue) - rule.sequence_digits
 
     if target_date.year != latest_date.year:
         sequence = 1
     else:
-        sequence = int(latest_issue[rule.year_digits:]) + 1
+        sequence = int(latest_issue[year_digits:]) + 1
+    if sequence > 366:
+        raise ValueError("Issue sequence exceeds annual limit")
 
-    year_prefix = str(target_date.year)[-rule.year_digits:]
+    year_prefix = str(target_date.year)[-year_digits:]
     return f"{year_prefix}{sequence:0{rule.sequence_digits}d}"
 
 

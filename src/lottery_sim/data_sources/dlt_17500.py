@@ -1,4 +1,6 @@
 import csv
+
+from lottery_sim.draw_metadata import METADATA_FIELDS, metadata_from_row, metadata_to_row
 import re
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +33,7 @@ def save_dlt_draws_csv(draws: Iterable[DrawDLT], path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "front", "back", "source"])
+        writer = csv.DictWriter(f, fieldnames=["issue", "draw_date", "front", "back", "source"] + METADATA_FIELDS)
         writer.writeheader()
         for draw in draws:
             writer.writerow({
@@ -40,11 +42,12 @@ def save_dlt_draws_csv(draws: Iterable[DrawDLT], path: Path) -> None:
                 "front": draw.numbers.front_text,
                 "back": draw.numbers.back_text,
                 "source": draw.source,
+                **metadata_to_row(draw),
             })
 
 
 def load_dlt_draws_csv(path: Path) -> List[DrawDLT]:
-    with Path(path).open("r", encoding="utf-8", newline="") as f:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
         rows = csv.DictReader(f)
         return [
             DrawDLT(
@@ -55,6 +58,7 @@ def load_dlt_draws_csv(path: Path) -> List[DrawDLT]:
                     back=_parse_back_text(row["back"]),
                 ),
                 source=row.get("source") or "local",
+                **metadata_from_row(row),
             )
             for row in rows
         ]

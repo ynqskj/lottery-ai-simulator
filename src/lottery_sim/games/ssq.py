@@ -16,6 +16,11 @@ class SsqGame:
         "未中奖": 0,
     }
 
+    def __init__(self, special_prize_active=False):
+        self.special_prize_active = special_prize_active
+        self.prize_amounts = dict(type(self).prize_amounts)
+        self.prize_amounts["福运奖"] = 5
+
     def validate_pick(self, pick: SsqPick) -> SsqPick:
         if len(pick.red) != 6:
             raise ValueError("双色球红球必须包含6个号码")
@@ -48,6 +53,8 @@ class SsqGame:
             return "五等奖"
         if blue_hit == 1 and red_hits <= 2:
             return "六等奖"
+        if red_hits == 3 and blue_hit == 0 and self.special_prize_active is True:
+            return "福运奖"
         return "未中奖"
 
     def payout(self, draw_numbers: SsqPick, pick_numbers: SsqPick) -> int:

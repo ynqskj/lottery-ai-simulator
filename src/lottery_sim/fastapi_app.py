@@ -68,7 +68,10 @@ def create_fastapi_app(reports_dir: Path, repo_root: Path):
     @app.post("/login")
     async def login(request: Request):
         form = _parse_form_body(await request.body())
-        user = auth_store.authenticate(form.get("username", ""), form.get("password", ""))
+        try:
+            user = auth_store.authenticate(form.get("username", ""), form.get("password", ""))
+        except ValueError:
+            user = None
         if user is None:
             return HTMLResponse(_render_login_page("Invalid username or password."), status_code=401)
         token = auth_store.create_session(user.username)
@@ -171,6 +174,23 @@ def create_fastapi_app(reports_dir: Path, repo_root: Path):
             return JSONResponse({"ok": False, "error": "job not found"}, status_code=404)
         return StreamingResponse(_job_sse_events(job), media_type="text/event-stream")
 
+    @app.post("/api/llm/{action}")
+    async def llm_action(action: str, request: Request):
+        from starlette.concurrency import run_in_threadpool
+        from lottery_sim import llm_service
+        from lottery_sim.dashboard import llm_snapshot
+        user = current_user(request)
+        if user is None:
+            return unauthorized_api_response()
+        workspace = workspace_for_user(root_path, user.username)
+        form = _parse_form_body(await request.body())
+        try:
+            snapshot = await run_in_threadpool(llm_snapshot, workspace.reports_dir) if action == "summary" else None
+            result = await run_in_threadpool(llm_service.perform_action, workspace.history_db, action, form, snapshot)
+            return JSONResponse(result)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
     @app.post("/api/config")
     async def config(request: Request):
         user = current_user(request)
@@ -185,7 +205,10 @@ def create_fastapi_app(reports_dir: Path, repo_root: Path):
                 for key, values in parse_qs(body.decode("utf-8")).items()
                 if values
             }
-        save_dashboard_config(workspace.history_db, form)
+        try:
+            save_dashboard_config(workspace.history_db, form)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         return {"ok": True}
 
     @app.get("/api/export")

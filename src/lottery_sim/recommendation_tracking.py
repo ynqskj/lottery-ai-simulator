@@ -1,9 +1,13 @@
+from lottery_sim.issue_calendar import normalize_issue
 import csv
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
+from lottery_sim.draw_metadata import PAYOUT_BASIS_LABELS, payout_basis_summary
+from lottery_sim.prize_rules import evaluate_draw_prize, game_for_draw
+from lottery_sim.file_io import atomic_path
 from lottery_sim.models import DltPick, Kl8Pick, QlcPick, QxcPick, SsqPick
 
 
@@ -31,6 +35,7 @@ class RecommendationRecord:
     payout: float = 0
     generated_at: str = ""
     run_id: str = ""
+    payout_basis: str = "estimated"
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ _CSV_FIELDS = [
     "payout",
     "generated_at",
     "run_id",
+    "payout_basis",
 ]
 
 DRAW_READY_TIME = datetime_time(22, 0)
@@ -77,17 +83,17 @@ def select_recommendation_window(
     target_issue: str = "",
     history_until_issue: str = "",
 ) -> RecommendationWindow:
-    ordered = tuple(sorted(draws, key=lambda draw: int(draw.issue)))
+    ordered = tuple(sorted(draws, key=lambda draw: normalize_issue(draw.issue)))
     if not ordered:
         raise ValueError("没有可用于生成推荐的历史开奖数据")
 
-    if target_issue and history_until_issue and int(history_until_issue) >= int(target_issue):
+    if target_issue and history_until_issue and normalize_issue(history_until_issue) >= normalize_issue(target_issue):
         raise ValueError("历史截止期号必须早于目标期号，避免使用目标期开奖数据")
 
     if history_until_issue:
-        history = tuple(draw for draw in ordered if int(draw.issue) <= int(history_until_issue))
+        history = tuple(draw for draw in ordered if normalize_issue(draw.issue) <= normalize_issue(history_until_issue))
     elif target_issue:
-        history = tuple(draw for draw in ordered if int(draw.issue) < int(target_issue))
+        history = tuple(draw for draw in ordered if normalize_issue(draw.issue) < normalize_issue(target_issue))
     else:
         history = ordered
 
@@ -143,7 +149,7 @@ def create_recommendation_records(
 def save_recommendation_records(records: Iterable[RecommendationRecord], path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as f:
+    with atomic_path(path) as temporary, temporary.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
         writer.writeheader()
         for record in records:
@@ -163,11 +169,12 @@ def save_recommendation_records(records: Iterable[RecommendationRecord], path: P
                 "payout": _format_number(record.payout),
                 "generated_at": record.generated_at,
                 "run_id": record.run_id,
+                "payout_basis": record.payout_basis,
             })
 
 
 def load_recommendation_records(path: Path) -> List[RecommendationRecord]:
-    with Path(path).open("r", encoding="utf-8", newline="") as f:
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as f:
         rows = csv.DictReader(f)
         return [
             RecommendationRecord(
@@ -186,6 +193,7 @@ def load_recommendation_records(path: Path) -> List[RecommendationRecord]:
                 payout=float(row.get("payout") or 0),
                 generated_at=row.get("generated_at") or "",
                 run_id=row.get("run_id") or "",
+                payout_basis=row.get("payout_basis") or "estimated",
             )
             for row in rows
         ]
@@ -199,11 +207,11 @@ def evaluate_recommendation_records(
     as_of: Optional[datetime] = None,
 ) -> RecommendationVerificationResult:
     now = as_of or datetime.now()
-    draw_by_issue = {draw.issue: draw for draw in draws}
+    draw_by_issue = {normalize_issue(draw.issue): draw for draw in draws}
     evaluated: List[RecommendationRecord] = []
 
     for record in records:
-        draw = draw_by_issue.get(record.target_issue)
+        draw = draw_by_issue.get(normalize_issue(record.target_issue))
         if draw is None or not _draw_is_ready(draw, now):
             evaluated.append(RecommendationRecord(
                 game_code=record.game_code,
@@ -224,8 +232,8 @@ def evaluate_recommendation_records(
             ))
             continue
 
-        pick = game.validate_pick(pick_parser(record.numbers))
-        payout = game.payout(draw.numbers, pick)
+        pick = game_for_draw(game, draw).validate_pick(pick_parser(record.numbers))
+        level, payout, payout_basis = evaluate_draw_prize(game, draw, pick)
         evaluated.append(RecommendationRecord(
             game_code=record.game_code,
             game_name=record.game_name,
@@ -237,9 +245,10 @@ def evaluate_recommendation_records(
             reason=record.reason,
             status="checked",
             draw_numbers=_number_text(draw),
-            prize_level=_prize_level(game, draw.numbers, pick, payout),
+            prize_level=level,
             cost=record.cost,
             payout=payout,
+            payout_basis=payout_basis,
             generated_at=record.generated_at,
             run_id=record.run_id,
         ))
@@ -272,10 +281,11 @@ def render_recommendation_verification_report(result: RecommendationVerification
         f"中奖记录：{result.winning_count}",
         f"总投入：{_format_number(result.total_cost)}",
         f"总奖金：{_format_number(result.total_payout)}",
+        payout_basis_summary(record for record in result.records if record.status == "checked"),
         f"投资回报率：{result.roi:.2f}",
         "",
-        "期号 | 批次 | 生成时间 | 排名 | 策略 | 推荐号码 | 开奖号码 | 奖级 | 奖金 | 状态",
-        "--- | --- | --- | ---: | --- | --- | --- | --- | ---: | ---",
+        "期号 | 批次 | 生成时间 | 排名 | 策略 | 推荐号码 | 开奖号码 | 奖级 | 奖金 | 奖金口径 | 状态",
+        "--- | --- | --- | ---: | --- | --- | --- | --- | ---: | --- | ---",
     ]
     for record in result.records:
         lines.append(
@@ -288,6 +298,7 @@ def render_recommendation_verification_report(result: RecommendationVerification
             f"{record.draw_numbers or '-'} | "
             f"{record.prize_level or '-'} | "
             f"{_format_number(record.payout)} | "
+            f"{PAYOUT_BASIS_LABELS.get(record.payout_basis, '估算奖金')} | "
             f"{record.status}"
         )
 
@@ -327,7 +338,7 @@ def _draw_is_ready(draw: Any, as_of: datetime) -> bool:
     try:
         draw_date = datetime.strptime(getattr(draw, "draw_date", ""), "%Y-%m-%d").date()
     except (TypeError, ValueError):
-        return True
+        return False
     if draw_date < as_of.date():
         return True
     if draw_date > as_of.date():

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$DataDir = "data/normalized",
     [string]$ReportDir = "reports/latest",
@@ -12,13 +12,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Utf8 = [System.Text.UTF8Encoding]::new()
+[Console]::InputEncoding = $Utf8
 [Console]::OutputEncoding = $Utf8
 $OutputEncoding = $Utf8
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $RepoRoot
 $env:PYTHONPATH = "src"
+$PythonExecutable = $env:LOTTERY_PYTHON
+if (-not $PythonExecutable) {
+    $LocalPython = Join-Path $RepoRoot ".venv/Scripts/python.exe"
+    if (Test-Path -LiteralPath $LocalPython) { $PythonExecutable = $LocalPython }
+    else { $PythonExecutable = (Get-Command python -ErrorAction Stop).Source }
+}
 
 $fucai3dCsv = "$DataDir/fucai3d.csv"
 $pl3Csv = "$DataDir/pl3.csv"
@@ -52,7 +60,7 @@ function Invoke-LotteryCommand {
         [string]$OutputFile = ""
     )
 
-    $commandText = "python -m lottery_sim.cli " + ($Arguments -join " ")
+    $commandText = "`"$PythonExecutable`" -m lottery_sim.cli " + ($Arguments -join " ")
     if ($OutputFile) {
         $commandText = "$commandText > $OutputFile"
     }
@@ -63,13 +71,13 @@ function Invoke-LotteryCommand {
     }
 
     if ($OutputFile) {
-        $output = & python -m lottery_sim.cli @Arguments 2>&1
+        $output = & $PythonExecutable -m lottery_sim.cli @Arguments 2>&1
         $exitCode = $LASTEXITCODE
         $output | Set-Content -Path $OutputFile -Encoding UTF8
         Write-Host "  -> $OutputFile"
     }
     else {
-        & python -m lottery_sim.cli @Arguments
+        & $PythonExecutable -m lottery_sim.cli @Arguments
         $exitCode = $LASTEXITCODE
     }
 

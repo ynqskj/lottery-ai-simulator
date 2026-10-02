@@ -39,7 +39,7 @@ class DashboardMultiUserTests(unittest.TestCase):
 
         self.assertEqual(first.status, "running")
         self.assertEqual(second.status, "failed")
-        self.assertIn("already has a running job", "\n".join(second.output_lines))
+        self.assertIn("已有任务运行", "\n".join(second.output_lines))
         thread.start.assert_called_once()
 
     def test_user_report_path_resolves_private_and_shared_data_dirs(self):

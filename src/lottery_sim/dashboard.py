@@ -1,9 +1,11 @@
+from lottery_sim.draw_metadata import PAYOUT_BASIS_LABELS
 import csv
 import html
 import json
 import os
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -297,11 +299,35 @@ def load_dashboard_model(reports_dir: Path) -> DashboardModel:
         other_reports=other_reports,
         config=config,
         training_records=training_records,
-        ai_summary=_build_ai_summary(games, config, training_records),
+        ai_summary=_saved_ai_summary(db_path) or "尚未生成大模型报告。" + _build_ai_summary(games, config, training_records),
     )
 
 
+def _saved_ai_summary(db_path: Path) -> str:
+    from lottery_sim.llm_service import latest_summary
+    report = latest_summary(db_path)
+    if not report:
+        return ""
+    return f"生成时间：{report['created_at']}；模型：{report['model']}\n{report['content']}"
+
+
+def llm_snapshot(reports_dir: Path) -> dict:
+    model = load_dashboard_model(reports_dir)
+    return {"generated_at": model.generated_at, "summary": model.recommendation_summary[:10000],
+            "games": [{"code": game.code, "name": game.name,
+                       "reports": {key: text[:1500] for key, text in list(game.reports.items())[:6]}}
+                      for game in model.games],
+            "note": "每份报告最多保留1500字，长期汇总最多10000字。金额依据报告标注；历史模拟和候选评分不能保证未来中奖。"}
+
+
 def save_dashboard_config(db_path: Path, config: Dict[str, str]) -> None:
+    from lottery_sim.llm_service import _base_url
+    if config.get("llm_base_url", "").strip():
+        _base_url(config)
+    config = dict(config)
+    if not config.get("llm_api_key", "").strip():
+        config.pop("llm_api_key", None)
+    config["llm_provider"] = "openai-compatible"
     _save_sqlite_dashboard_config(Path(db_path), config)
 
 
@@ -368,7 +394,10 @@ def run_dashboard_action(
             output=f"Unsupported game code: {game_code}",
         )
 
-    command = _dashboard_command(action, game_code, options or {})
+    try:
+        command = _dashboard_command(action, game_code, options or {})
+    except ValueError as exc:
+        return DashboardActionResult(action=action, ok=False, exit_code=2, command="", output=str(exc))
     if command is None:
         return DashboardActionResult(
             action=action,
@@ -476,28 +505,48 @@ def _dashboard_daily_options(game_code: str, options: Dict[str, str]) -> List[st
         ("mlRetrainEvery", "-MlRetrainEvery", ""),
     ]
 
+    bounds = {"count": (1, 1000), "mlMinHistory": (1, 10000),
+              "mlMinTrain": (2, 20000), "mlTrainEpochs": (1, 200),
+              "mlBacktestLimit": (1, 1000), "mlBacktestEpochs": (1, 100),
+              "mlRetrainEvery": (1, 1000)}
     command_options: List[str] = []
     for key, flag, default in option_specs:
         value = (options.get(key, "") or default).strip()
         if not value:
             continue
-        if not value.isdigit():
-            continue
+        low, high = bounds[key]
+        if not value.isascii() or not value.isdigit() or not low <= int(value) <= high:
+            raise ValueError(f"{key} 必须是 {low} 到 {high} 之间的整数")
         command_options.extend([flag, value])
+
+    counts = options.get("positionCounts", "").strip()
+    if counts:
+        maximums = {"3d": (10,)*3, "pl3": (10,)*3, "pl5": (10,)*5, "qxc": (10,)*6+(15,)}.get(game_code)
+        parts = counts.split(",")
+        if maximums is None or len(parts) != len(maximums) or any(not value.isascii() or not value.isdigit() or not 1 <= int(value) <= maximum for value, maximum in zip(parts, maximums)):
+            raise ValueError("每位候选数量与彩种不匹配或超出号码范围")
+        mode = options.get("combinationMode", "top")
+        if mode not in {"top", "full"}:
+            raise ValueError("组合模式无效")
+        product = 1
+        for value in parts:
+            product *= int(value)
+        if mode == "full" and product > 1000:
+            raise ValueError("全组合最多1000注，请缩小每位候选数量")
+        if mode == "top" and int(options.get("count") or 10) > product:
+            raise ValueError("候选数量超过组合池大小")
+        command_options.extend(["-PositionCounts", counts, "-CombinationMode", mode])
     return command_options
 
 
 def _default_command_runner(command: Sequence[str], cwd: Path) -> Tuple[int, str, str]:
-    completed = subprocess.run(
-        list(command),
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=_command_env(),
-    )
-    return completed.returncode, completed.stdout, completed.stderr
+    lines = []
+    try:
+        code = _stream_command(command, cwd, lines.append)
+        return code, "\n".join(lines), ""
+    except (OSError, ValueError, TimeoutError) as exc:
+        return 1, "\n".join(lines), str(exc)
+
 
 
 def start_dashboard_job(
@@ -518,18 +567,18 @@ def start_dashboard_job(
     if game_code not in valid_game_codes:
         return _failed_dashboard_job(action, game_code, f"Unsupported game code: {game_code}")
 
-    if user_key and _user_has_running_dashboard_job(user_key):
-        return _failed_dashboard_job(action, game_code, f"User {user_key} already has a running job.")
-
-    command = _dashboard_command(
-        action,
-        game_code,
-        options or {},
-        data_dir=data_dir,
-        report_dir=report_dir,
-        recommendation_dir=recommendation_dir,
-        model_dir=model_dir,
-    )
+    try:
+        command = _dashboard_command(
+            action,
+            game_code,
+            options or {},
+            data_dir=data_dir,
+            report_dir=report_dir,
+            recommendation_dir=recommendation_dir,
+            model_dir=model_dir,
+        )
+    except ValueError as exc:
+        return _failed_dashboard_job(action, game_code, str(exc))
     if command is None:
         return _failed_dashboard_job(action, game_code, f"Unknown action: {action}")
 
@@ -541,9 +590,26 @@ def start_dashboard_job(
         report_dir=report_dir,
         history_data_dir=history_data_dir,
     )
-    _store_dashboard_job(job)
+    with _DASHBOARD_JOBS_LOCK:
+        if user_key and any(item.user_key == user_key and item.status == "running" for item in _DASHBOARD_JOBS.values()):
+            # Return an unstored rejection while holding the registry lock.
+            rejected = _create_dashboard_job(action, game_code, [], user_key=user_key)
+            rejected.status = "failed"
+            rejected.exit_code = 2
+            rejected.finished_at = time.time()
+            rejected.output_lines.append("当前账号已有任务运行，请等待完成")
+            return rejected
+        _DASHBOARD_JOBS[job.job_id] = job
+        _prune_dashboard_jobs_locked()
     worker = threading.Thread(target=_run_dashboard_job, args=(job, Path(repo_root)), daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except RuntimeError as exc:
+        with job.lock:
+            job.status = "failed"
+            job.exit_code = 1
+            job.finished_at = time.time()
+            job.output_lines.append(f"任务启动失败：{exc}")
     return job
 
 
@@ -615,7 +681,11 @@ def _prune_dashboard_jobs_locked() -> None:
 
 
 def _run_dashboard_job(job: DashboardJob, repo_root: Path) -> None:
-    exit_code = _stream_command(job.command, repo_root, lambda line: _update_job_from_output_line(job, line))
+    try:
+        exit_code = _stream_command(job.command, repo_root, lambda line: _update_job_from_output_line(job, line))
+    except Exception as exc:
+        exit_code = 1
+        _update_job_from_output_line(job, f"任务失败：{exc}")
     with job.lock:
         job.exit_code = exit_code
         job.finished_at = time.time()
@@ -624,7 +694,7 @@ def _run_dashboard_job(job: DashboardJob, repo_root: Path) -> None:
         job.stage_index = len(job.stage_labels)
     try:
         _record_dashboard_job_history(job, repo_root)
-    except OSError as exc:
+    except Exception as exc:
         with job.lock:
             job.output_lines.append(f"历史记录写入失败：{exc}")
 
@@ -736,6 +806,7 @@ def _stream_command(
     cwd: Path,
     on_line: Callable[[str], None],
 ) -> int:
+    timeout = min(7200, max(1, float(os.environ.get("LOTTERY_JOB_TIMEOUT", "1800"))))
     process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -747,10 +818,44 @@ def _stream_command(
         env=_command_env(),
         bufsize=1,
     )
-    if process.stdout is not None:
-        for raw_line in process.stdout:
-            on_line(raw_line.rstrip("\r\n"))
-    return process.wait()
+    expired = threading.Event()
+    def stop_process():
+        expired.set()
+        _terminate_process_tree(process)
+    timer = threading.Timer(timeout, stop_process)
+    timer.daemon = True
+    timer.start()
+    try:
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                on_line(raw_line.rstrip("\r\n"))
+        code = process.wait()
+        if expired.is_set():
+            raise TimeoutError(f"任务超过 {timeout:g} 秒，已终止")
+        return code
+    finally:
+        timer.cancel()
+        if process.poll() is None:
+            _terminate_process_tree(process)
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def _terminate_process_tree(process) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
 
 
 def _update_job_from_output_line(job: DashboardJob, line: str) -> None:
@@ -891,6 +996,8 @@ def _command_env() -> Dict[str, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env.setdefault("PYTHONPATH", "src")
+    if not env.get("LOTTERY_CLI_EXE"):
+        env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -1095,7 +1202,7 @@ def _build_ai_summary(
     return (
         f"大模型接口{configured}；当前推荐记录{total_recommendations}条，"
         f"待开奖{pending}条，中奖记录{winning}条；最近训练/生成记录：{latest_training}。"
-        "未配置 API 时使用本地规则总结，配置后可扩展为真实大模型报告。"
+        "以上为本地统计。配置并测试连接后，点击“生成总结”调用所选模型；刷新页面只显示保存结果。"
     )
 
 
@@ -1383,6 +1490,8 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 
 def _recommendation_record_stats(records: Sequence[RecommendationRecord]) -> Dict[str, Any]:
+    from lottery_sim.recommendation_store import unique_recommendation_records
+    records = unique_recommendation_records(records)
     checked = [record for record in records if record.status == "checked"]
     winning = [record for record in checked if record.payout > 0]
     latest = max(records, key=_recommendation_record_sort_key, default=None)
@@ -1534,12 +1643,12 @@ def _render_backend_panel(model: DashboardModel) -> str:
   <section class="backend-grid">
     <form class="backend-card" id="llm-config-form">
       <h3>大模型 API 配置</h3>
-      <label>服务商<input name="llm_provider" value="{html.escape(config.llm_provider)}" placeholder="openai-compatible"></label>
+      <p>OpenAI 兼容协议</p>
       <label>Base URL<input name="llm_base_url" value="{html.escape(config.llm_base_url)}" placeholder="https://api.example.com/v1"></label>
-      <label>模型名称<input name="llm_model" value="{html.escape(config.llm_model)}" placeholder="gpt-4.1-mini"></label>
-      <label>API Key<input name="llm_api_key" value="" placeholder="{html.escape(config.llm_api_key_masked or '未配置')}"></label>
-      <button type="submit" class="action-button">保存配置</button>
-      <p class="panel-note" id="config-save-status">API Key 只保存在本地 SQLite，不会提交到 GitHub。</p>
+      <label>模型<input name="llm_model" list="llm-model-list" value="{html.escape(config.llm_model)}" placeholder="选择或手动填写模型 ID"></label><datalist id="llm-model-list"></datalist>
+      <label>API Key<input type="password" autocomplete="new-password" name="llm_api_key" value="" placeholder="{html.escape(config.llm_api_key_masked or '未配置')}"></label>
+      <div class="action-buttons"><button type="button" class="action-button" data-llm-action="models">获取模型</button><button type="button" class="action-button" data-llm-action="test">测试连接</button><button type="submit" class="action-button">保存配置</button></div>
+      <p class="panel-note" id="config-save-status" role="status" aria-live="polite">模型列表获取失败时，可以手动填写模型 ID。密钥留空保留已保存密钥。</p>
     </form>
     <section class="backend-card">
       <h3>模型训练记录</h3>
@@ -1547,7 +1656,7 @@ def _render_backend_panel(model: DashboardModel) -> str:
     </section>
     <section class="backend-card">
       <h3>AI 报告总结</h3>
-      <p>{html.escape(model.ai_summary)}</p>
+      <button type="button" class="action-button" data-llm-action="summary">生成总结</button><pre id="ai-summary-content">{html.escape(model.ai_summary)}</pre>
     </section>
     <section class="backend-card">
       <h3>导出 CSV/HTML</h3>
@@ -1625,7 +1734,7 @@ def _render_recommendation_batch(batch: RecommendationBatchHistory) -> str:
     <span>候选 {batch.count}</span>
     <span>{status}</span>
     <span>中奖 {batch.winning_count}</span>
-    <span>奖金 {_format_dashboard_amount(batch.payout)}</span>
+    <span>模拟奖金（含估算） {_format_dashboard_amount(batch.payout)}</span>
     <strong class="batch-toggle-text">展开明细</strong>
   </summary>
   <div class="batch-detail">
@@ -1651,7 +1760,7 @@ def _render_recommendation_batch_detail_row(record: RecommendationRecord) -> str
         f"<td>{html.escape(record.draw_numbers or '-')}</td>"
         f"<td>{html.escape(prize)}</td>"
         f"<td>{hit_detail}</td>"
-        f"<td>{_format_dashboard_amount(record.payout)}</td>"
+        f"<td>{_format_dashboard_amount(record.payout)} <small>{html.escape(PAYOUT_BASIS_LABELS.get(record.payout_basis, '估算')) if record.status == 'checked' else ''}</small></td>"
         f"<td>{status}</td>"
         "</tr>"
     )
@@ -1673,6 +1782,11 @@ def _render_action_pane(game: GameDashboard, active: bool) -> str:
 
 def _render_ml_controls(game: GameDashboard) -> str:
     ml_name = _ml_display_name(game)
+    position_controls = ""
+    maxima = {"3d": (10,)*3, "pl3": (10,)*3, "pl5": (10,)*5, "qxc": (10,)*6+(15,)}.get(game.code)
+    if maxima:
+        fields = "".join(f'<label class="param-field">第{index+1}位候选个数<input type="number" min="1" max="{maximum}" value="2" data-position-count></label>' for index, maximum in enumerate(maxima))
+        position_controls = f'<details class="advanced-params"><summary>每位选择多个号码</summary><label><input type="checkbox" data-position-enable>启用位组合</label><div class="param-grid">{fields}</div><label>生成方式<select data-combination-mode><option value="top">按评分选前N注</option><option value="full">生成全部组合</option></select></label><p data-combination-preview role="status" aria-live="polite"></p><p>全部组合最多1000注；前N注使用上方候选数量。每注2元，组合数不代表中奖概率。</p></details>'
     basic_controls = [
         ("候选数量", "count", "10", "生成几组候选号码。日常看 5-10 组就够，多了只会增加选择负担。"),
         ("回测期数", "mlBacktestLimit", "30", "用最近多少期历史做模拟验证。越大越慢，但更能看长期表现。"),
@@ -1691,6 +1805,7 @@ def _render_ml_controls(game: GameDashboard) -> str:
   <p class="panel-note">回测期数改成35后，需要点“生成推荐报告”或“更新并生成推荐”重新生成机器学习回测；只点“更新开奖数据”只抓新开奖，不会重算回测。</p>
   {_render_ml_context(game)}
   <div class="basic-param-grid">{_render_param_fields(basic_controls)}</div>
+  {position_controls}
   <details class="advanced-params">
     <summary>高级机器学习参数</summary>
     <div class="param-grid">{_render_param_fields(advanced_controls)}</div>
@@ -1929,7 +2044,7 @@ def _primary_candidates(game: GameDashboard) -> List[DashboardCandidate]:
 
 def _render_game_summary(game: GameDashboard, summary_text: str) -> str:
     scoped = _filter_summary_for_game(summary_text, game)
-    note = "<p class=\"panel-note\">已开奖后才计算投入和奖金；待开奖记录只增加推荐记录数，不会增加已开奖投入。</p>"
+    note = "<p class=\"panel-note\">已开奖后才计算投入和奖金；待开奖记录只增加推荐记录数，不会增加已开奖投入。奖金含估算，具体口径见明细，非实际领取收益。</p>"
     content = note + (_pre(scoped) if scoped else "<p class=\"empty\">暂无该彩种长期汇总。</p>")
     content += _render_recommendation_history_table(game)
     return f"<section class=\"view\" data-view=\"summary-{html.escape(game.code)}\"><section class=\"panel\"><h2>{html.escape(game.name)} 长期汇总</h2>{content}</section></section>"
@@ -1970,7 +2085,7 @@ def _render_recommendation_history_row(record: RecommendationRecord, draw_date: 
         f"<td>{html.escape(record.draw_numbers or '-')}</td>"
         f"<td>{html.escape(prize)}</td>"
         f"<td>{hit_detail}</td>"
-        f"<td>{_format_dashboard_amount(record.payout)}</td>"
+        f"<td>{_format_dashboard_amount(record.payout)} <small>{html.escape(PAYOUT_BASIS_LABELS.get(record.payout_basis, '估算')) if record.status == 'checked' else ''}</small></td>"
         f"<td>{status}</td>"
         "</tr>"
     )
@@ -2099,7 +2214,7 @@ def _render_game_card(game: GameDashboard) -> str:
     <div><dt>已开奖</dt><dd>{game.recommendation_checked}</dd></div>
     <div><dt>待开奖</dt><dd>{game.recommendation_pending}</dd></div>
     <div><dt>中奖记录</dt><dd>{game.recommendation_winning}</dd></div>
-    <div><dt>奖金</dt><dd>{html.escape(payout)}</dd></div>
+    <div><dt>模拟奖金（含估算）</dt><dd>{html.escape(payout)}</dd></div>
     <div><dt>最新目标期</dt><dd>{html.escape(latest_target)}</dd></div>
   </div>
   <p class="metric-note">总览只统计已保存的推荐记录；开奖数据更新后会校验待开奖记录并填入中奖结果。</p>
@@ -2162,7 +2277,7 @@ def _filter_summary_for_game(summary_text: str, game: GameDashboard) -> str:
     if table_start < 0:
         names = SUMMARY_GAME_ALIASES.get(game.code, (game.name,))
         return summary_text if any(name in summary_text for name in names) else ""
-    scoped = ["推荐长期表现汇总", "", lines[table_start]]
+    scoped = ["推荐长期表现汇总"] + [line for line in lines[:table_start] if line.startswith(("统计口径", "奖金口径"))] + ["", lines[table_start]]
     if table_start + 1 < len(lines):
         scoped.append(lines[table_start + 1])
     for line in lines[table_start + 2:]:
@@ -2229,7 +2344,7 @@ def _strip_money(value: str) -> str:
 def _read_text(path: Path) -> str:
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8-sig")
 
 
 def _pre(text: str) -> str:
@@ -2284,14 +2399,28 @@ def _make_dashboard_handler(reports_dir: Path, repo_root: Path):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            if path.startswith("/api/llm/"):
+                from lottery_sim.llm_service import perform_action
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                params = parse_qs(self.rfile.read(length).decode("utf-8"))
+                form = {key: values[0] for key, values in params.items() if values}
+                action = path.rsplit("/", 1)[-1]
+                try:
+                    result = perform_action(_dashboard_db_path_for_root(repo_root), action, form,
+                                            llm_snapshot(reports_dir) if action == "summary" else None)
+                    self._send(200, "application/json; charset=utf-8", json.dumps(result, ensure_ascii=False).encode("utf-8"))
+                except ValueError as exc:
+                    self._send(400, "application/json; charset=utf-8", json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"))
+                return
             if path == "/api/config":
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
                 params = parse_qs(raw)
-                save_dashboard_config(
-                    _dashboard_db_path_for_root(repo_root),
-                    {key: values[0] for key, values in params.items() if values},
-                )
+                try:
+                    save_dashboard_config(_dashboard_db_path_for_root(repo_root), {key: values[0] for key, values in params.items() if values})
+                except ValueError as exc:
+                    self._send(400, "application/json; charset=utf-8", json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8"))
+                    return
                 body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
                 self._send(200, "application/json; charset=utf-8", body)
                 return
@@ -3037,6 +3166,10 @@ function actionParams(button) {
   params.set('game', button.dataset.game);
   const pane = button.closest('[data-game-pane]');
   if (pane) {
+    if (pane.querySelector('[data-position-enable]')?.checked) {
+      params.set('positionCounts', Array.from(pane.querySelectorAll('[data-position-count]'), input => input.value).join(','));
+      params.set('combinationMode', pane.querySelector('[data-combination-mode]').value);
+    }
     pane.querySelectorAll('[data-action-param]').forEach((input) => {
       if (input.value !== '') {
         params.set(input.dataset.actionParam, input.value);
@@ -3045,6 +3178,22 @@ function actionParams(button) {
   }
   return params;
 }
+document.querySelectorAll('[data-game-pane]').forEach(pane => {
+  const enabled = pane.querySelector('[data-position-enable]');
+  if (!enabled) return;
+  const fields = Array.from(pane.querySelectorAll('[data-position-count]'));
+  const mode = pane.querySelector('[data-combination-mode]');
+  const update = () => {
+    fields.forEach(input => input.disabled = !enabled.checked);
+    mode.disabled = !enabled.checked;
+    const product = fields.reduce((total,input) => total * Number(input.value),1);
+    const count = Number(pane.querySelector('[data-action-param="count"]').value);
+    const generated = mode.value === 'full' ? product : Math.min(count,product);
+    pane.querySelector('[data-combination-preview]').textContent = !enabled.checked ? '启用后按各位评分取候选号码。' : `组合池 ${product} 注，预计生成 ${generated} 注，模拟投入 ${generated*2} 元` + (mode.value === 'full' && product > 1000 ? '；超过1000注上限，请缩小数量' : mode.value === 'top' && count > product ? '；候选数量超过组合池，请减小候选数量' : '');
+  };
+  pane.addEventListener('input',update); pane.addEventListener('change',update); update();
+});
+
 gameActionTabs.forEach((tab) => {
   tab.addEventListener('click', () => {
     const game = tab.dataset.gameTab;
@@ -3078,15 +3227,39 @@ recommendationBatches.forEach((batch) => {
   batch.addEventListener('toggle', updateLabel);
 });
 if (llmConfigForm) {
-  llmConfigForm.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const response = await fetch('/api/config', {
-      method: 'POST',
-      body: new URLSearchParams(new FormData(llmConfigForm)),
-    });
-    configSaveStatus.textContent = response.ok ? '配置已保存到本地 SQLite' : '配置保存失败';
-  });
+  let llmBusy = false;
+  async function llmRequest(action) {
+    if (llmBusy) return;
+    llmBusy = true;
+    const buttons = document.querySelectorAll('[data-llm-action], #llm-config-form button');
+    buttons.forEach(button => button.disabled = true);
+    configSaveStatus.textContent = action === 'save' ? '正在保存…' : '正在请求，请稍候…';
+    try {
+      const response = await fetch(action === 'save' ? '/api/config' : `/api/llm/${action}`, {
+        method: 'POST', body: new URLSearchParams(new FormData(llmConfigForm))
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || '请求失败');
+      if (action === 'models') {
+        const list = document.getElementById('llm-model-list');
+        list.replaceChildren();
+        result.models.forEach(id => { const option = document.createElement('option'); option.value = id; list.appendChild(option); });
+        configSaveStatus.textContent = `已获取 ${result.models.length} 个模型，请选择或手动填写`;
+      } else if (action === 'summary') {
+        document.getElementById('ai-summary-content').textContent = `生成时间：${result.report.created_at}；模型：${result.report.model}\n${result.report.content}`;
+        configSaveStatus.textContent = '报告已生成并保存';
+      } else configSaveStatus.textContent = action === 'save' ? '配置已保存' : '连接成功：模型文本请求成功';
+    } catch (error) { configSaveStatus.textContent = error.message; }
+    finally { llmBusy = false; buttons.forEach(button => button.disabled = false); }
+  }
+  llmConfigForm.addEventListener('submit', event => { event.preventDefault(); llmRequest('save'); });
+  document.querySelectorAll('[data-llm-action]').forEach(button => button.addEventListener('click', () => llmRequest(button.dataset.llmAction)));
+  ['llm_base_url','llm_api_key'].forEach(name => llmConfigForm.elements[name].addEventListener('input', () => {
+    document.getElementById('llm-model-list').replaceChildren();
+    configSaveStatus.textContent = '连接配置已修改，请重新获取模型或测试连接';
+  }));
 }
+
 document.querySelectorAll('[data-export]').forEach((button) => {
   button.addEventListener('click', async () => {
     const format = button.dataset.export;
